@@ -50,21 +50,22 @@ elan toolchain install "$TOOLCHAIN"
 
 # ---------------------------------------------------------------- dependencies
 if [[ ! -f lake-manifest.json ]]; then
-  log "Resolving dependencies (first run: clones Mathlib, takes a while)"
-  # Mathlib's post-update hook also fetches the cache here.
+  # Only when there is no lockfile: pick revisions and write one.
+  log "Resolving dependencies (no lake-manifest.json yet)"
   lake update
-else
-  log "Dependencies already resolved (lake-manifest.json present)"
 fi
 
+# With a committed lake-manifest.json (the normal case on a fresh clone),
+# any lake command clones missing packages at the locked revisions, so this
+# step both materializes .lake/packages and downloads Mathlib's .olean cache.
+log "Fetching dependencies at locked revisions + Mathlib .olean cache (first run: several GB)"
+lake exe cache get
+
 # Mathlib must use exactly our toolchain, or the cache is useless.
+[[ -f .lake/packages/mathlib/lean-toolchain ]] || die "Mathlib was not fetched into lean_env/.lake/packages"
 MATHLIB_TC="$(tr -d '[:space:]' < .lake/packages/mathlib/lean-toolchain)"
 [[ "$MATHLIB_TC" == "$TOOLCHAIN" ]] || die "toolchain mismatch: lean_env=$TOOLCHAIN mathlib=$MATHLIB_TC
 Update lean_env/lean-toolchain to match, then re-run."
-
-# ---------------------------------------------------------------- mathlib cache
-log "Fetching Mathlib .olean cache"
-lake exe cache get
 
 # ---------------------------------------------------------------- build
 log "Building Harness (axiom check)"
