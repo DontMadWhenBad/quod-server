@@ -1,3 +1,4 @@
 .env
 lean_env/.lake/
 /bin/
+*.txt

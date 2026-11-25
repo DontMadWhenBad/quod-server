@@ -102,7 +102,29 @@ Pick the server with `-s URL` before the command (for example
 - **Shutdown:** on Ctrl-C or SIGTERM the server stops accepting jobs, waits
   `-grace` for running ones, cancels the rest, then exits.
 
-## Tests
+## Running as a service
+
+`deploy/quod-server.service` is a systemd **user** unit. It assumes the
+checkout is at `~/quod-server` and starts at boot (lingering), restarting
+on failure:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp deploy/quod-server.service ~/.config/systemd/user/
+echo 'QUOD_ADDR=100.x.y.z:8080' > ~/.config/quod-server.env   # optional; default 127.0.0.1:8080
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now quod-server
+```
+
+```sh
+systemctl --user start|stop|restart|status quod-server
+journalctl --user -u quod-server -f          # logs
+systemctl --user disable --now quod-server   # stop and don't start at boot
+```
+
+Update: `git pull && scripts/bootstrap.sh && go build -o bin/server ./cmd/server && systemctl --user restart quod-server`.
+
 
 ```sh
 go test ./internal/...                                          # unit tests (no Lean, no API)
