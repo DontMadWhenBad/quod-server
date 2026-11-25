@@ -66,8 +66,8 @@ type Options struct {
 	BudgetUSD float64 `json:"budget_usd,omitempty"` // LLM spending cap for this job
 	NoSplit   bool    `json:"no_split,omitempty"`
 	NoExplain bool    `json:"no_explain,omitempty"`
-	Attempts  int     `json:"attempts,omitempty"` // proof attempts per session
-	Parallel  int     `json:"parallel,omitempty"` // proof sessions per statement
+	Attempts  int     `json:"attempts,omitempty"` // if > 0: attempts per session in every stage
+	Parallel  int     `json:"parallel,omitempty"` // if > 0: sessions in every stage
 }
 
 var (

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -14,13 +15,22 @@ import (
 
 // Options tunes a Pipeline. Zero values get defaults.
 type Options struct {
-	MaxFormalizeAttempts int  // Lean-rejected formalizations before giving up; default 3
-	MaxRevisions         int  // user corrections per statement; default 3
-	MaxProofAttempts     int  // per proof session; default 6
-	ParallelSessions     int  // independent proof sessions racing; default 1
-	SkipSplit            bool // treat the whole input as one statement
-	NoExplain            bool
-	MaxStatements        int // reject inputs that split into more; 0 = unlimited
+	MaxFormalizeAttempts int // Lean-rejected formalizations before giving up; default 3
+	MaxRevisions         int // user corrections per statement; default 3
+	// Stages is the escalation ladder for proof search; nil means
+	// DefaultStages(the agent's prover model).
+	Stages []Stage
+	// MaxProofAttempts and ParallelSessions, if > 0, override every
+	// stage's Attempts and Sessions.
+	MaxProofAttempts int
+	ParallelSessions int
+	// Automation tactics are tried directly in Lean before any LLM call;
+	// nil means DefaultAutomation. NoAutomation skips this step.
+	Automation    []string
+	NoAutomation  bool
+	SkipSplit     bool // treat the whole input as one statement
+	NoExplain     bool
+	MaxStatements int // reject inputs that split into more; 0 = unlimited
 	// LeanHeader starts LeanFile; default "import Mathlib\nimport Harness".
 	LeanHeader string
 	Feedback   lean.FeedbackOptions
@@ -36,16 +46,55 @@ func (o Options) withDefaults() Options {
 	if o.MaxRevisions <= 0 {
 		o.MaxRevisions = 3
 	}
-	if o.MaxProofAttempts <= 0 {
-		o.MaxProofAttempts = 6
-	}
-	if o.ParallelSessions <= 0 {
-		o.ParallelSessions = 1
-	}
 	if o.LeanHeader == "" {
 		o.LeanHeader = "import Mathlib\nimport Harness"
 	}
 	return o
+}
+
+// Stage is one rung of the proof-search ladder.
+type Stage struct {
+	Name     string        `json:"name"`
+	Spec     llm.ModelSpec `json:"spec"`
+	Sessions int           `json:"sessions"` // parallel sessions racing
+	Attempts int           `json:"attempts"` // propose→check rounds per session
+}
+
+// DefaultStages escalates from many cheap, non-thinking attempts (Lean's
+// fast feedback does the checking) to fewer, deliberate ones. Measured on
+// easy Mathlib goals, thinking time is dominated by the model second-guessing
+// lemma names it cannot look up, not by the mathematics.
+func DefaultStages(model string) []Stage {
+	if model == "" {
+		model = llm.ModelFlash
+	}
+	return []Stage{
+		{Name: "fast", Spec: llm.ModelSpec{Model: model, Effort: llm.EffortNone, MaxTokens: 4096}, Sessions: 4, Attempts: 3},
+		{Name: "think", Spec: llm.ModelSpec{Model: model, Effort: llm.EffortLow}, Sessions: 2, Attempts: 3},
+		{Name: "deep", Spec: llm.ModelSpec{Model: model, Effort: llm.EffortHigh}, Sessions: 2, Attempts: 4},
+	}
+}
+
+func (p *Pipeline) stages() []Stage {
+	st := p.opts.Stages
+	if st == nil {
+		st = DefaultStages(p.agent.Models().Prove.Model)
+	}
+	out := make([]Stage, len(st))
+	for i, s := range st {
+		if p.opts.ParallelSessions > 0 {
+			s.Sessions = p.opts.ParallelSessions
+		}
+		if p.opts.MaxProofAttempts > 0 {
+			s.Attempts = p.opts.MaxProofAttempts
+		}
+		s.Sessions, s.Attempts = max(s.Sessions, 1), max(s.Attempts, 1)
+		if s.Name == "" {
+			s.Name = fmt.Sprintf("stage%d", i+1)
+		}
+		out[i] = s
+	}
+	return out
 }
 
 // ErrTooManyStatements is returned when the input exceeds MaxStatements.
@@ -292,27 +341,122 @@ func renderStatementErrors(sc *lean.StatementCheck) string {
 	return strings.TrimSpace(b.String())
 }
 
-// prove races ParallelSessions proof sessions; the first verified outcome
-// wins and cancels the rest. Returns (nil, nil) if none succeeded.
+// prove first tries automation tactics directly in Lean, then climbs the
+// stage ladder: each stage races its sessions, the first verified outcome
+// wins and cancels the rest, and the next (more expensive) stage only runs
+// if the current one found nothing. Returns (nil, nil) if all failed.
 func (j *job) prove(ctx context.Context, sr *StatementResult, stmt lean.Statement, base *lean.Snapshot, lemmas []llm.Lemma) (*lean.Outcome, error) {
+	if !j.p.opts.NoAutomation {
+		o, err := j.automate(ctx, sr, stmt, base)
+		if err != nil || o != nil {
+			return o, err
+		}
+	}
+	in := llm.ProveInput{Name: stmt.Name, Signature: stmt.Signature, Text: sr.Text, Context: lemmas}
+	failed := &failedSet{m: map[string]string{}}
+	sessionNo := 0
+	stages := j.p.stages()
+	for i, st := range stages {
+		j.emit(Event{Type: EvStage, Stmt: sr.Index, Message: fmt.Sprintf("stage %d/%d %q: %s effort %s, %d session(s) × %d attempt(s)",
+			i+1, len(stages), st.Name, st.Spec.Model, effortName(st.Spec.Effort), st.Sessions, st.Attempts)})
+		o, err := j.runStage(ctx, sr, stmt, base, in, st, &sessionNo, failed)
+		if err != nil || o != nil {
+			return o, err
+		}
+	}
+	return nil, nil
+}
+
+// DefaultAutomation is tried, in order, before any LLM call. Each runs as
+// its own check, so one tactic's failure (or timeout) never hides another.
+var DefaultAutomation = []string{
+	"omega", "decide", "norm_num", "simp", "positivity",
+	"linarith", "nlinarith", "aesop", "exact?",
+}
+
+var reTryThis = regexp.MustCompile(`(?s)^Try this:\s*(?:\[apply\]\s*)?(.+)$`)
+
+// automate tries each automation tactic as a complete proof.
+func (j *job) automate(ctx context.Context, sr *StatementResult, stmt lean.Statement, base *lean.Snapshot) (*lean.Outcome, error) {
+	tactics := j.p.opts.Automation
+	if tactics == nil {
+		tactics = DefaultAutomation
+	}
+	t0 := time.Now()
+	for i, tac := range tactics {
+		t1 := time.Now()
+		o, err := j.p.check.CheckProof(ctx, base, stmt, tac)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("lean: %w", err)
+		}
+		if !o.Verdict.Verified {
+			continue
+		}
+		// `exact?` closes the goal by search; keep the term it found instead,
+		// so the final file is fast to re-check and readable.
+		if o.Result != nil {
+			for _, m := range o.Result.Messages {
+				if mm := reTryThis.FindStringSubmatch(strings.TrimSpace(m.Data)); mm != nil && m.Severity == "info" {
+					if o2, err := j.p.check.CheckProof(ctx, base, stmt, mm[1]); err == nil && o2.Verdict.Verified {
+						o, tac = o2, mm[1]
+					}
+					break
+				}
+			}
+		}
+		j.record(sr, AttemptRecord{Stage: "auto", N: i + 1, Body: tac, Verified: true, LeanTime: time.Since(t1)})
+		j.emit(Event{Type: EvAutomation, Stmt: sr.Index, Message: fmt.Sprintf("closed by automation: %s", tac)})
+		return o, nil
+	}
+	j.emit(Event{Type: EvAutomation, Stmt: sr.Index, Message: fmt.Sprintf("automation: none of %d tactics closed the goal (%s)",
+		len(tactics), time.Since(t0).Round(10*time.Millisecond))})
+	return nil, nil
+}
+
+// failedSet holds proofs already rejected for one statement, shared by all
+// sessions and stages, so repeats are not re-checked.
+type failedSet struct {
+	mu sync.Mutex
+	m  map[string]string // normalized body -> feedback given
+}
+
+func (f *failedSet) get(body string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fb, ok := f.m[body]
+	return fb, ok
+}
+
+func (f *failedSet) add(body, feedback string) {
+	f.mu.Lock()
+	f.m[body] = feedback
+	f.mu.Unlock()
+}
+
+// runStage races st.Sessions sessions; the first verified outcome wins.
+func (j *job) runStage(ctx context.Context, sr *StatementResult, stmt lean.Statement, base *lean.Snapshot,
+	in llm.ProveInput, st Stage, sessionNo *int, failed *failedSet) (*lean.Outcome, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	n := j.p.opts.ParallelSessions
 	type res struct {
 		o   *lean.Outcome
 		err error
 	}
-	ch := make(chan res, n)
-	in := llm.ProveInput{Name: stmt.Name, Signature: stmt.Signature, Text: sr.Text, Context: lemmas}
-	for s := 1; s <= n; s++ {
+	ch := make(chan res, st.Sessions)
+	for range st.Sessions {
+		*sessionNo++
+		sn := *sessionNo
 		go func() {
-			o, err := j.session(ctx, s, sr, stmt, base, in)
+			o, err := j.session(ctx, sn, st, sr, stmt, base, in, failed)
 			ch <- res{o, err}
 		}()
 	}
 	var win *lean.Outcome
 	var firstErr error
-	for range n {
+	for range st.Sessions {
 		r := <-ch
 		switch {
 		case r.o != nil && win == nil:
@@ -332,20 +476,36 @@ func (j *job) prove(ctx context.Context, sr *StatementResult, stmt lean.Statemen
 	return nil, firstErr
 }
 
+// thinkingEvery throttles "thinking…" progress events per attempt.
+const thinkingEvery = 10 * time.Second
+
 // session runs one propose → check → feedback loop.
-func (j *job) session(ctx context.Context, sn int, sr *StatementResult, stmt lean.Statement, base *lean.Snapshot, in llm.ProveInput) (*lean.Outcome, error) {
-	sess := j.p.agent.NewProofSession(in)
-	failed := map[string]bool{} // normalized bodies already rejected
-	for k := 1; k <= j.p.opts.MaxProofAttempts; k++ {
+func (j *job) session(ctx context.Context, sn int, st Stage, sr *StatementResult, stmt lean.Statement,
+	base *lean.Snapshot, in llm.ProveInput, failed *failedSet) (*lean.Outcome, error) {
+	sess := j.p.agent.NewProofSessionWith(in, st.Spec)
+	for k := 1; k <= st.Attempts; k++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		rec := AttemptRecord{Session: sn, N: k}
+		rec := AttemptRecord{Stage: st.Name, Session: sn, N: k, Model: st.Spec.Model, Effort: effortName(st.Spec.Effort)}
 		t0 := time.Now()
-		body, resp, err := sess.Next(ctx)
+		lastEmit := t0
+		var progMu sync.Mutex
+		body, resp, err := sess.NextProgress(ctx, func(p llm.Progress) {
+			progMu.Lock()
+			defer progMu.Unlock()
+			if time.Since(lastEmit) < thinkingEvery {
+				return
+			}
+			lastEmit = time.Now()
+			j.emit(Event{Type: EvThinking, Stmt: sr.Index, Message: fmt.Sprintf("session %d attempt %d (%s): thinking… %d tokens after %s",
+				sn, k, st.Name, p.ReasoningChunks+p.ContentChunks, time.Since(t0).Round(time.Second))})
+		})
 		rec.LLMTime = time.Since(t0)
 		if resp != nil {
 			rec.CostUSD = resp.CostUSD
+			rec.CompletionTokens = resp.Usage.CompletionTokens
+			rec.ReasoningTokens = resp.Usage.ReasoningTokens()
 		}
 		if err != nil {
 			if fatalErr(ctx, err) {
@@ -361,9 +521,10 @@ func (j *job) session(ctx context.Context, sn int, sr *StatementResult, stmt lea
 		rec.Body = body
 
 		norm := lean.NormalizeBody(body)
-		if failed[norm] {
+		if fb, seen := failed.get(norm); seen {
 			rec.ErrorKinds = []string{"repeated"}
-			rec.Feedback = "This proof is identical to an earlier attempt that already failed. Use a different approach."
+			rec.Feedback = "This proof is identical to an earlier attempt that already failed with:\n\n" + fb +
+				"\n\nUse a different approach."
 			j.record(sr, rec)
 			sess.Feedback(rec.Feedback)
 			continue
@@ -389,10 +550,17 @@ func (j *job) session(ctx context.Context, sn int, sr *StatementResult, stmt lea
 		if rec.Verified {
 			return o, nil
 		}
-		failed[norm] = true
+		failed.add(norm, rec.Feedback)
 		sess.Feedback(rec.Feedback)
 	}
 	return nil, nil
+}
+
+func effortName(e llm.Effort) string {
+	if e == llm.EffortDefault {
+		return "default"
+	}
+	return string(e)
 }
 
 // fatalErr reports errors that should stop the whole job.

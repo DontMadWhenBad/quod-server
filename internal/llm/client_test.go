@@ -154,3 +154,58 @@ func TestPricing(t *testing.T) {
 		t.Errorf("unknown = %g", got)
 	}
 }
+
+func TestChatStreaming(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["stream"] != true {
+			t.Errorf("stream not requested: %v", body)
+		}
+		if so, _ := body["stream_options"].(map[string]any); so["include_usage"] != true {
+			t.Errorf("include_usage not requested: %v", body["stream_options"])
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, l := range []string{
+			": keep-alive",
+			`data: {"model":"deepseek-flash","choices":[{"delta":{"reasoning_content":"Let me"}}]}`,
+			`data: {"choices":[{"delta":{"reasoning_content":" think."}}]}`,
+			`data: {"choices":[{"delta":{"content":"` + "```lean\\nsimp\\n```" + `"}}]}`,
+			`data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":30,"prompt_cache_miss_tokens":10,"completion_tokens_details":{"reasoning_tokens":20}}}`,
+			"data: [DONE]",
+		} {
+			io.WriteString(w, l+"\n\n")
+		}
+	})
+	var calls int
+	var last Progress
+	resp, err := c.Chat(context.Background(), Request{Model: ModelFlash, Messages: []Message{User("x")},
+		OnProgress: func(p Progress) { calls++; last = p }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reasoning != "Let me think." || resp.Content != "```lean\nsimp\n```" || resp.FinishReason != "stop" {
+		t.Errorf("resp = %+v", resp)
+	}
+	if resp.Usage.ReasoningTokens() != 20 || resp.CostUSD == 0 || resp.Model != ModelFlash {
+		t.Errorf("usage/cost/model: %+v %g %q", resp.Usage, resp.CostUSD, resp.Model)
+	}
+	if calls < 3 || last.ReasoningChunks != 2 || last.ContentChunks != 1 {
+		t.Errorf("progress calls=%d last=%+v", calls, last)
+	}
+}
+
+func TestChatStreamEndsEarly(t *testing.T) {
+	var n atomic.Int32
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1) == 1 { // first try: connection drops mid-stream
+			io.WriteString(w, `data: {"choices":[{"delta":{"reasoning_content":"hm"}}]}`+"\n\n")
+			return
+		}
+		io.WriteString(w, `data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n")
+	})
+	resp, err := c.Chat(context.Background(), Request{Model: ModelFlash, Messages: []Message{User("x")}, OnProgress: func(Progress) {}})
+	if err != nil || resp.Content != "ok" || n.Load() != 2 {
+		t.Fatalf("err=%v resp=%+v calls=%d", err, resp, n.Load())
+	}
+}

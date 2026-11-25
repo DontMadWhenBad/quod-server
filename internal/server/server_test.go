@@ -206,14 +206,16 @@ func (h *harness) readSSE(path, lastID string) []sseEvent {
 func TestJobLifecycleAndSSE(t *testing.T) {
 	h := newHarness(t, jobs.Config{}, "")
 	v := h.submit(`{"input": "a; b"}`)
-	if v.ID == "" || v.Options.Attempts != 6 || v.BudgetUSD != 0.25 {
+	if v.ID == "" || v.Options.Attempts != 0 || v.BudgetUSD != 0.25 {
 		t.Fatalf("view = %+v", v)
 	}
 	done := h.waitState(v.ID, jobs.StateDone)
 	if len(done.Statements) != 2 || done.Statements[1].Status != pipeline.StatusProved || !strings.Contains(done.LeanFile, "theorem stmt_2") {
 		t.Fatalf("done = %+v", done)
 	}
-	if done.CostUSD != 0.02 {
+	// Each statement costs at least one proof call ($0.01); racing sessions
+	// in the first stage may add more.
+	if done.CostUSD < 0.02 {
 		t.Errorf("cost = %g", done.CostUSD)
 	}
 

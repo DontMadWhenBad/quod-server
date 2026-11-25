@@ -34,9 +34,10 @@ func main() {
 		sbMem     = flag.String("sandbox-mem", "10G", "memory limit per Lean worker; empty = none")
 		sbTasks   = flag.Int("sandbox-tasks", 256, "process/thread limit per Lean worker; 0 = none")
 		model     = flag.String("model", llm.ModelFlash, "prover model: deepseek-flash | deepseek-v4-pro")
-		effort    = flag.String("effort", "high", "prover reasoning effort: low | high | max")
-		attempts  = flag.Int("attempts", 6, "proof attempts per session")
-		parallel  = flag.Int("parallel", 1, "parallel proof sessions per statement")
+		effort    = flag.String("effort", "", "single stage at this effort (none|low|high|max) instead of the fast→think→deep ladder")
+		attempts  = flag.Int("attempts", 0, "if > 0: proof attempts per session in every stage")
+		parallel  = flag.Int("parallel", 0, "if > 0: parallel proof sessions in every stage")
+		noAuto    = flag.Bool("no-auto", false, "skip trying automation tactics before the LLM")
 		budget    = flag.Float64("budget", 0.50, "max USD to spend (0 = unlimited)")
 		timeout   = flag.Duration("timeout", 30*time.Minute, "overall time limit")
 		confirm   = flag.Bool("confirm", false, "ask before proving each formalized statement")
@@ -75,7 +76,13 @@ func main() {
 		fatal("%v", err)
 	}
 	models := llm.DefaultModels()
-	models.Prove = llm.ModelSpec{Model: *model, Effort: llm.Effort(*effort)}
+	models.Prove = llm.ModelSpec{Model: *model, Effort: llm.EffortHigh}
+	var stages []pipeline.Stage // nil = default ladder on *model
+	if *effort != "" {
+		stages = []pipeline.Stage{{Name: *effort, Spec: llm.ModelSpec{Model: *model, Effort: llm.Effort(*effort)}, Sessions: 1, Attempts: 6}}
+	} else {
+		stages = pipeline.DefaultStages(*model)
+	}
 	leanVersion := "Lean 4 + Mathlib"
 	if tc, err := os.ReadFile(filepath.Join(*leanDir, "lean-toolchain")); err == nil {
 		v := strings.TrimSpace(string(tc))
@@ -113,8 +120,10 @@ func main() {
 	}
 	popts := pipeline.Options{
 		Verifier:         verifier,
+		Stages:           stages,
 		MaxProofAttempts: *attempts,
 		ParallelSessions: *parallel,
+		NoAutomation:     *noAuto,
 		SkipSplit:        *noSplit,
 		NoExplain:        *noExplain,
 	}
@@ -234,8 +243,12 @@ func printEvent(e pipeline.Event, verbose bool) {
 		if a.Verified {
 			status = "✓ verified"
 		}
-		progress("%sattempt %d.%d %s  (llm %s, lean %s, $%.4f)", tag, a.Session, a.N, status,
-			a.LLMTime.Round(100*time.Millisecond), a.LeanTime.Round(time.Millisecond), a.CostUSD)
+		if a.Stage == "auto" {
+			progress("%sautomation `%s` %s  (lean %s)", tag, a.Body, status, a.LeanTime.Round(time.Millisecond))
+			break
+		}
+		progress("%s[%s] attempt %d.%d %s  (llm %s, %d thinking tok, lean %s, $%.4f)", tag, a.Stage, a.Session, a.N, status,
+			a.LLMTime.Round(100*time.Millisecond), a.ReasoningTokens, a.LeanTime.Round(time.Millisecond), a.CostUSD)
 		if verbose && !a.Verified && a.Feedback != "" {
 			fmt.Fprintln(os.Stderr, indent(a.Feedback, "           │ "))
 		}
@@ -245,6 +258,8 @@ func printEvent(e pipeline.Event, verbose bool) {
 		progress("%sFAILED: %s", tag, e.Statement.Error)
 	case pipeline.EvExplained:
 		// shown in the final report
+	case pipeline.EvStage, pipeline.EvAutomation, pipeline.EvThinking:
+		progress("%s%s", tag, e.Message)
 	case pipeline.EvVerifying:
 		progress("%s%s...", tag, e.Message)
 	case pipeline.EvVerified:

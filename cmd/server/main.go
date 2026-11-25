@@ -39,7 +39,8 @@ func main() {
 		maxRunning  = flag.Int("max-running", 2, "jobs running at once")
 		maxQueued   = flag.Int("max-queued", 32, "jobs waiting before 429")
 		model       = flag.String("model", llm.ModelFlash, "prover model")
-		effort      = flag.String("effort", "high", "prover reasoning effort: low | high | max")
+		effort      = flag.String("effort", "", "single stage at this effort (none|low|high|max) instead of the fast→think→deep ladder")
+		noAuto      = flag.Bool("no-auto", false, "skip trying automation tactics before the LLM")
 		jobBudget   = flag.Float64("job-budget", 0.25, "default USD budget per job")
 		maxBudget   = flag.Float64("max-job-budget", 1.00, "max USD budget a client may request")
 		dailyBudget = flag.Float64("daily-budget", 5.00, "USD cap across all jobs per UTC day (<0 = unlimited)")
@@ -64,7 +65,11 @@ func main() {
 		fatal(log, "llm client", err)
 	}
 	models := llm.DefaultModels()
-	models.Prove = llm.ModelSpec{Model: *model, Effort: llm.Effort(*effort)}
+	models.Prove = llm.ModelSpec{Model: *model, Effort: llm.EffortHigh}
+	stages := pipeline.DefaultStages(*model)
+	if *effort != "" {
+		stages = []pipeline.Stage{{Name: *effort, Spec: llm.ModelSpec{Model: *model, Effort: llm.Effort(*effort)}, Sessions: 1, Attempts: 6}}
+	}
 
 	// Listen first so /healthz answers while Lean loads; job endpoints
 	// return 503 until the pool is ready.
@@ -135,6 +140,8 @@ func main() {
 		MaxBudgetUSD:     *maxBudget,
 		DailyBudgetUSD:   *dailyBudget,
 		JobTimeout:       *jobTimeout,
+		Stages:           stages,
+		NoAutomation:     *noAuto,
 	})
 	srv.SetManager(mgr)
 

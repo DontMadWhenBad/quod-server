@@ -75,6 +75,9 @@ func NewAgent(c Chatter, opts Options) *Agent {
 	return &Agent{c: c, opts: opts}
 }
 
+// Models returns the model assignment.
+func (a *Agent) Models() Models { return a.opts.Models }
+
 // Spent returns the estimated USD spent and the number of calls.
 func (a *Agent) Spent() (usd float64, calls int) {
 	a.mu.Lock()
@@ -83,6 +86,10 @@ func (a *Agent) Spent() (usd float64, calls int) {
 }
 
 func (a *Agent) call(ctx context.Context, spec ModelSpec, asJSON bool, msgs ...Message) (*Response, error) {
+	return a.callProgress(ctx, spec, asJSON, nil, msgs...)
+}
+
+func (a *Agent) callProgress(ctx context.Context, spec ModelSpec, asJSON bool, onProgress func(Progress), msgs ...Message) (*Response, error) {
 	a.mu.Lock()
 	if a.opts.BudgetUSD > 0 && a.spent >= a.opts.BudgetUSD {
 		a.mu.Unlock()
@@ -90,7 +97,8 @@ func (a *Agent) call(ctx context.Context, spec ModelSpec, asJSON bool, msgs ...M
 	}
 	a.mu.Unlock()
 
-	resp, err := a.c.Chat(ctx, Request{Model: spec.Model, Effort: spec.Effort, MaxTokens: spec.MaxTokens, JSON: asJSON, Messages: msgs})
+	resp, err := a.c.Chat(ctx, Request{Model: spec.Model, Effort: spec.Effort, MaxTokens: spec.MaxTokens,
+		JSON: asJSON, Messages: msgs, OnProgress: onProgress})
 	if resp != nil {
 		a.mu.Lock()
 		a.spent += resp.CostUSD
@@ -229,6 +237,7 @@ type ProveInput struct {
 // several sessions for parallel attempts.
 type ProofSession struct {
 	a       *Agent
+	spec    ModelSpec
 	intro   Message
 	rounds  []round // completed (proof, feedback) pairs
 	pending string  // last proposed reply awaiting feedback
@@ -237,8 +246,14 @@ type ProofSession struct {
 
 type round struct{ reply, feedback string }
 
-// NewProofSession starts a proof conversation.
+// NewProofSession starts a proof conversation with the default prover
+// model (Models.Prove).
 func (a *Agent) NewProofSession(in ProveInput) *ProofSession {
+	return a.NewProofSessionWith(in, a.opts.Models.Prove)
+}
+
+// NewProofSessionWith starts a proof conversation using spec.
+func (a *Agent) NewProofSessionWith(in ProveInput, spec ModelSpec) *ProofSession {
 	var b strings.Builder
 	if c := renderLemmas("Previously proved theorems you may use:", in.Context, true); c != "" {
 		b.WriteString(c + "\n")
@@ -247,11 +262,16 @@ func (a *Agent) NewProofSession(in ProveInput) *ProofSession {
 		fmt.Fprintf(&b, "Informal statement: %s\n\n", oneLine(in.Text))
 	}
 	fmt.Fprintf(&b, "Prove:\n```lean\ntheorem %s %s := by\n  ...\n```\nReply with the tactic script only.", in.Name, in.Signature)
-	return &ProofSession{a: a, intro: User(b.String())}
+	return &ProofSession{a: a, spec: spec, intro: User(b.String())}
 }
 
 // Next asks for a proof (the first one, or a fix after Feedback).
 func (s *ProofSession) Next(ctx context.Context) (body string, resp *Response, err error) {
+	return s.NextProgress(ctx, nil)
+}
+
+// NextProgress is Next with streaming progress reports (see Request.OnProgress).
+func (s *ProofSession) NextProgress(ctx context.Context, onProgress func(Progress)) (body string, resp *Response, err error) {
 	msgs := []Message{s.a.system(proveSystem), s.intro}
 	if s.dropped > 0 {
 		msgs = append(msgs, Assistant("(earlier attempts omitted)"),
@@ -260,7 +280,7 @@ func (s *ProofSession) Next(ctx context.Context) (body string, resp *Response, e
 	for _, r := range s.rounds {
 		msgs = append(msgs, Assistant(r.reply), User(r.feedback))
 	}
-	resp, err = s.a.call(ctx, s.a.opts.Models.Prove, false, msgs...)
+	resp, err = s.a.callProgress(ctx, s.spec, false, onProgress, msgs...)
 	if err != nil {
 		return "", resp, err
 	}

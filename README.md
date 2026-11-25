@@ -45,9 +45,9 @@ echo "..." | ./bin/prove -json    # machine-readable result
 | `-i` | off | prompt repeatedly (`\` continues a line, `:q` quits, Ctrl-C cancels a job) |
 | `-v` | off | show Lean feedback for failed attempts |
 | `-model` | `deepseek-flash` | prover model (`deepseek-v4-pro` for harder problems) |
-| `-effort` | `high` | reasoning effort: `low`, `high`, `max` |
-| `-attempts` | 6 | proof attempts per session |
-| `-parallel` | 1 | proof sessions racing per statement |
+| `-effort` | (ladder) | run a single stage at this effort (`none`, `low`, `high`, `max`) instead of the ladder |
+| `-attempts`, `-parallel` | (per stage) | if set, override attempts per session and sessions in every stage |
+| `-no-auto` | off | skip the automation tactics tried before the LLM |
 | `-budget` | 0.50 | USD cap for the run/session |
 | `-workers` | 1 | warm Lean workers (each job gets a fresh one; use 2 with `-i`) |
 | `-sandbox` | `bwrap` | Lean isolation: `bwrap` or `none` (trusted input only) |
@@ -89,7 +89,9 @@ scripts/client.sh prove --confirm -v "1) ... 2) ..."
 scripts/client.sh list | watch ID | result ID | status ID | cancel ID
 ```
 
-Set `PROVER_URL` (default `http://127.0.0.1:8080`) and `API_TOKEN` if needed.
+Pick the server with `-s URL` before the command (for example
+`scripts/client.sh -s http://127.0.0.1:18080 list`) or with `PROVER_URL`
+(default `http://127.0.0.1:8080`). Set `API_TOKEN` if the server needs one.
 
 - **Limits:** `-max-running`, `-max-queued` (429 when full), `-job-budget`,
   `-max-job-budget`, `-daily-budget`, `-job-timeout`. Input is capped at 8 KB
@@ -140,6 +142,26 @@ scripts/client.sh     example API client
 ```
 
 ## How it works
+
+- **Proof search.** First, automation: `omega`, `decide`, `norm_num`, `simp`,
+  `positivity`, `linarith`, `nlinarith`, `aesop` and `exact?` are tried
+  directly in Lean, with no LLM cost. If `exact?` succeeds, the term it found
+  becomes the proof. Then the model works up a ladder of stages, each racing
+  parallel sessions (propose → Lean check → feedback). A stage runs only if
+  the previous one failed, and repeated proofs are shared across sessions:
+
+  | stage | effort | sessions × attempts |
+  |---|---|---|
+  | `fast` | `none` | 4 × 3 |
+  | `think` | `low` | 2 × 3 |
+  | `deep` | `high` | 2 × 4 |
+
+  On easy goals, the model's thinking time goes mostly into second-guessing
+  Mathlib lemma names it cannot look up, which can mean 3–20k tokens and up
+  to a minute or more per attempt. Lean answers those questions in
+  milliseconds, so many cheap attempts with feedback usually win. Long
+  thinking streams `thinking… N tokens` progress events, and every attempt
+  records its model, effort and token counts.
 
 - **Incremental checking.** Each worker imports Mathlib once at startup
   (seconds). Every check after that runs against the loaded environment

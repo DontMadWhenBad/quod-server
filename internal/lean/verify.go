@@ -129,13 +129,15 @@ const (
 	jobModule  = "QuodJob"
 )
 
-// SpecCode is the Lean file holding only the confirmed statements.
+// SpecCode is the Lean file holding only the confirmed statements, in
+// namespace QuodSpec so it can be loaded next to the job module.
 func SpecCode(items []VerifyItem) string {
 	var b strings.Builder
-	b.WriteString("import Mathlib\n")
+	b.WriteString("import Mathlib\n\nnamespace " + specModule + "\n")
 	for _, it := range items {
 		fmt.Fprintf(&b, "\ntheorem %s %s := sorry\n", it.Name, strings.TrimSpace(it.Signature))
 	}
+	b.WriteString("\nend " + specModule + "\n")
 	return b.String()
 }
 
@@ -203,24 +205,20 @@ func (v *Verifier) Verify(ctx context.Context, jobCode string, items []VerifyIte
 		return rep, nil
 	}
 
-	// Step 3: kernel re-check and statement/axiom check, read-only.
+	// Step 3: kernel re-check, then statement/axiom check, read-only. Run
+	// one after the other: each loads Mathlib, and together with the job's
+	// worker they can exhaust RAM on a 16 GB machine.
 	lp := envValue(v.cfg.Env, "LEAN_PATH")
-	var kern, ver runResult
-	parallel(
-		func() {
-			env := withEnv(v.cfg.Env, "LEAN_PATH", lp+":"+jobDir)
-			kern = v.run(ctx, env, jobDir, []mount{{path: jobDir}}, v.checkerBin(), jobModule)
-		},
-		func() {
-			env := withEnv(v.cfg.Env, "LEAN_PATH", lp+":"+specDir+":"+jobDir)
-			args := append([]string{v.trustedRoots(), specModule, jobModule}, names(items)...)
-			ver = v.run(ctx, env, base, []mount{{path: specDir}, {path: jobDir}}, v.verifyBin(), args...)
-		},
-	)
-	for _, r := range []runResult{kern, ver} {
-		if r.err != nil {
-			return nil, fmt.Errorf("lean: verification step failed to run: %w", r.err)
-		}
+	kern := v.run(ctx, withEnv(v.cfg.Env, "LEAN_PATH", lp+":"+jobDir), jobDir,
+		[]mount{{path: jobDir}}, v.checkerBin(), jobModule)
+	if err := crashed("kernel re-check (leanchecker)", kern); err != nil {
+		return nil, err
+	}
+	args := append([]string{v.trustedRoots(), specModule, jobModule}, names(items)...)
+	ver := v.run(ctx, withEnv(v.cfg.Env, "LEAN_PATH", lp+":"+specDir+":"+jobDir), base,
+		[]mount{{path: specDir}, {path: jobDir}}, v.verifyBin(), args...)
+	if err := crashed("statement/axiom check (harness_verify)", ver); err != nil {
+		return nil, err
 	}
 	rep.KernelOK = kern.code == 0
 	if !rep.KernelOK {
@@ -228,6 +226,7 @@ func (v *Verifier) Verify(ctx context.Context, jobCode string, items []VerifyIte
 	}
 
 	got := map[string]VerifiedItem{}
+	jobErr := "" // whole-job rejection (untrusted import, name clash with the spec)
 	for _, line := range strings.Split(ver.stdout, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -238,18 +237,23 @@ func (v *Verifier) Verify(ctx context.Context, jobCode string, items []VerifyIte
 			return nil, fmt.Errorf("lean: bad checker output %q: %w", line, err)
 		}
 		if it.Name == "" { // whole-job failure (e.g. untrusted import)
+			jobErr = it.Error
 			rep.Log += "statement check rejected the job: " + it.Error + "\n"
 			continue
 		}
 		got[it.Name] = it
+	}
+	if len(got) == 0 && jobErr == "" {
+		// Exited without any verdict: a crash, not a rejection.
+		return nil, fmt.Errorf("lean: harness_verify gave no verdict (exit %d): %s", ver.code, tail(ver.stderr, 500))
 	}
 	rep.OK = rep.KernelOK
 	for _, it := range items {
 		r, ok := got[it.Name]
 		if !ok {
 			r = VerifiedItem{Name: it.Name, Error: "no verdict from checker"}
-			if ver.code != 0 && ver.stderr != "" {
-				r.Error += ": " + tail(ver.stderr, 500)
+			if jobErr != "" {
+				r.Error = jobErr
 			}
 		}
 		if !rep.KernelOK && r.OK {
@@ -260,6 +264,19 @@ func (v *Verifier) Verify(ctx context.Context, jobCode string, items []VerifyIte
 	}
 	rep.Duration = time.Since(start)
 	return rep, nil
+}
+
+// crashed reports infrastructure failures: the step could not run, timed
+// out, or was killed by a signal (bwrap reports 128+signal), e.g. by the
+// OOM killer. Those must never be mistaken for a rejected proof.
+func crashed(step string, r runResult) error {
+	if r.err != nil {
+		return fmt.Errorf("lean: %s failed to run: %w", step, r.err)
+	}
+	if r.code >= 128 || r.code < 0 {
+		return fmt.Errorf("lean: %s was killed (exit %d, likely out of memory): %s", step, r.code, tail(r.stderr, 300))
+	}
+	return nil
 }
 
 func (v *Verifier) compile(ctx context.Context, dir, module string) runResult {

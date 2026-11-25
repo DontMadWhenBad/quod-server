@@ -4,6 +4,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -56,6 +57,17 @@ type Request struct {
 	MaxTokens   int      // 0 = server default (64K in thinking mode)
 	JSON        bool     // response_format json_object; prompt must mention "json"
 	Temperature *float64 // ignored by the API in thinking mode
+	// OnProgress, if set, makes the call stream and is invoked as output
+	// arrives (from the HTTP goroutine; keep it fast). The Response is the
+	// same as without streaming.
+	OnProgress func(Progress)
+}
+
+// Progress reports streamed output so far. Chunks approximate tokens (the
+// API sends about one token per chunk; exact counts arrive in Usage).
+type Progress struct {
+	ReasoningChunks int
+	ContentChunks   int
 }
 
 // Usage is token accounting for one call.
@@ -158,6 +170,11 @@ type wireRequest struct {
 	ResponseFormat  *responseFormat `json:"response_format,omitempty"`
 	Temperature     *float64        `json:"temperature,omitempty"`
 	Stream          bool            `json:"stream"`
+	StreamOptions   *streamOptions  `json:"stream_options,omitempty"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type responseFormat struct {
@@ -191,6 +208,10 @@ func (c *Client) Chat(ctx context.Context, req Request) (*Response, error) {
 	if req.JSON {
 		wr.ResponseFormat = &responseFormat{Type: "json_object"}
 	}
+	if req.OnProgress != nil {
+		wr.Stream = true
+		wr.StreamOptions = &streamOptions{IncludeUsage: true}
+	}
 	body, err := json.Marshal(wr)
 	if err != nil {
 		return nil, err
@@ -199,7 +220,7 @@ func (c *Client) Chat(ctx context.Context, req Request) (*Response, error) {
 	maxRetries := c.MaxRetries
 	var lastErr error
 	for attempt := 0; ; attempt++ {
-		resp, retryAfter, err := c.once(ctx, body)
+		resp, retryAfter, err := c.once(ctx, body, req.OnProgress)
 		if err == nil || errors.Is(err, ErrTruncated) {
 			// Truncation is not transient; return the partial response so the
 			// caller still sees its cost and can decide what to do.
@@ -228,7 +249,7 @@ func (c *Client) Chat(ctx context.Context, req Request) (*Response, error) {
 	}
 }
 
-func (c *Client) once(ctx context.Context, body []byte) (*Response, time.Duration, error) {
+func (c *Client) once(ctx context.Context, body []byte, onProgress func(Progress)) (*Response, time.Duration, error) {
 	now := c.Now
 	if now == nil {
 		now = time.Now
@@ -239,7 +260,11 @@ func (c *Client) once(ctx context.Context, body []byte) (*Response, time.Duratio
 		return nil, 0, err
 	}
 	hreq.Header.Set("Content-Type", "application/json")
-	hreq.Header.Set("Accept", "application/json")
+	if onProgress != nil {
+		hreq.Header.Set("Accept", "text/event-stream")
+	} else {
+		hreq.Header.Set("Accept", "application/json")
+	}
 	hreq.Header.Set("Authorization", "Bearer "+c.APIKey)
 
 	hc := c.HTTP
@@ -251,12 +276,9 @@ func (c *Client) once(ctx context.Context, body []byte) (*Response, time.Duratio
 		return nil, 0, err // network error: retryable (unless ctx is done)
 	}
 	defer hresp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(hresp.Body, 32<<20))
-	if err != nil {
-		return nil, 0, err
-	}
 
 	if hresp.StatusCode/100 != 2 {
+		raw, _ := io.ReadAll(io.LimitReader(hresp.Body, 1<<20))
 		ae := &APIError{Status: hresp.StatusCode, Message: errorMessage(raw)}
 		switch hresp.StatusCode {
 		case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
@@ -266,36 +288,116 @@ func (c *Client) once(ctx context.Context, body []byte) (*Response, time.Duratio
 		return nil, retryAfter(hresp.Header.Get("Retry-After")), ae
 	}
 
+	var r *Response
+	if onProgress != nil {
+		r, err = readStream(hresp.Body, onProgress)
+	} else {
+		r, err = readJSON(hresp.Body)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	r.Latency = now().Sub(start)
+	r.CostUSD = c.pricing().Cost(r.Model, r.Usage, start)
+
+	switch r.FinishReason {
+	case "insufficient_system_resource", "aborted":
+		return nil, 0, &APIError{Message: "finish_reason=" + r.FinishReason, Retryable: true}
+	case "length":
+		return r, 0, ErrTruncated
+	}
+	return r, 0, nil
+}
+
+func readJSON(body io.Reader) (*Response, error) {
+	raw, err := io.ReadAll(io.LimitReader(body, 32<<20))
+	if err != nil {
+		return nil, err
+	}
 	// Body may be preceded by keep-alive blank lines; json skips whitespace.
 	var wr wireResponse
 	if err := json.Unmarshal(bytes.TrimSpace(raw), &wr); err != nil {
-		return nil, 0, &APIError{Message: fmt.Sprintf("decoding response: %v", err), Retryable: true}
+		return nil, &APIError{Message: fmt.Sprintf("decoding response: %v", err), Retryable: true}
 	}
 	if len(wr.Choices) == 0 {
-		return nil, 0, &APIError{Message: "response has no choices", Retryable: true}
+		return nil, &APIError{Message: "response has no choices", Retryable: true}
 	}
 	ch := wr.Choices[0]
-	r := &Response{
-		Model:        wr.Model,
-		FinishReason: ch.FinishReason,
-		Usage:        wr.Usage,
-		Latency:      now().Sub(start),
-	}
+	r := &Response{Model: wr.Model, FinishReason: ch.FinishReason, Usage: wr.Usage}
 	if ch.Message.Content != nil {
 		r.Content = *ch.Message.Content
 	}
 	if ch.Message.ReasoningContent != nil {
 		r.Reasoning = *ch.Message.ReasoningContent
 	}
-	r.CostUSD = c.pricing().Cost(wr.Model, wr.Usage, start)
+	return r, nil
+}
 
-	switch ch.FinishReason {
-	case "insufficient_system_resource", "aborted":
-		return nil, 0, &APIError{Message: "finish_reason=" + ch.FinishReason, Retryable: true}
-	case "length":
-		return r, 0, ErrTruncated
+type streamChunk struct {
+	Model   string `json:"model"`
+	Choices []struct {
+		Delta struct {
+			Content          *string `json:"content"`
+			ReasoningContent *string `json:"reasoning_content"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *Usage `json:"usage"`
+}
+
+// readStream assembles a Response from an SSE stream ("data: {...}" lines,
+// ": keep-alive" comments, terminated by "data: [DONE]").
+func readStream(body io.Reader, onProgress func(Progress)) (*Response, error) {
+	sc := bufio.NewScanner(body)
+	sc.Buffer(make([]byte, 64<<10), 8<<20)
+	var content, reasoning strings.Builder
+	var p Progress
+	r := &Response{}
+	done := false
+	for sc.Scan() {
+		line := sc.Text()
+		data, ok := strings.CutPrefix(line, "data:")
+		if !ok {
+			continue // blank separators and ": keep-alive" comments
+		}
+		data = strings.TrimSpace(data)
+		if data == "[DONE]" {
+			done = true
+			break
+		}
+		var ch streamChunk
+		if err := json.Unmarshal([]byte(data), &ch); err != nil {
+			return nil, &APIError{Message: fmt.Sprintf("decoding stream chunk: %v", err), Retryable: true}
+		}
+		if ch.Model != "" {
+			r.Model = ch.Model
+		}
+		if ch.Usage != nil {
+			r.Usage = *ch.Usage
+		}
+		for _, c := range ch.Choices {
+			if d := c.Delta.ReasoningContent; d != nil && *d != "" {
+				reasoning.WriteString(*d)
+				p.ReasoningChunks++
+			}
+			if d := c.Delta.Content; d != nil && *d != "" {
+				content.WriteString(*d)
+				p.ContentChunks++
+			}
+			if c.FinishReason != nil && *c.FinishReason != "" {
+				r.FinishReason = *c.FinishReason
+			}
+		}
+		onProgress(p)
 	}
-	return r, 0, nil
+	if err := sc.Err(); err != nil {
+		return nil, err // connection dropped mid-stream: retryable
+	}
+	if !done && r.FinishReason == "" {
+		return nil, &APIError{Message: "stream ended early", Retryable: true}
+	}
+	r.Content, r.Reasoning = content.String(), reasoning.String()
+	return r, nil
 }
 
 func (c *Client) pricing() Pricing {

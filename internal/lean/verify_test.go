@@ -12,7 +12,7 @@ import (
 
 func TestSpecCode(t *testing.T) {
 	got := SpecCode([]VerifyItem{{Name: "stmt_1", Signature: " (n : ℕ) : n = n "}, {Name: "stmt_2", Signature: ": True"}})
-	want := "import Mathlib\n\ntheorem stmt_1 (n : ℕ) : n = n := sorry\n\ntheorem stmt_2 : True := sorry\n"
+	want := "import Mathlib\n\nnamespace QuodSpec\n\ntheorem stmt_1 (n : ℕ) : n = n := sorry\n\ntheorem stmt_2 : True := sorry\n\nend QuodSpec\n"
 	if got != want {
 		t.Errorf("got:\n%s\nwant:\n%s", got, want)
 	}
@@ -59,6 +59,7 @@ func TestVerifier(t *testing.T) {
 		{"shadowed in-job checker", header +
 			"macro \"#harness_axioms \" i:ident : command => `(#eval IO.println (\"HARNESS_AXIOMS_OK \" ++ toString $(Lean.quote i.getId) ++ \": []\"))\n\n" +
 			"theorem stmt_1 (n : ℕ) : n + 0 = n := by\n  sorry\n\n#harness_axioms stmt_1" + stmt2, false, "sorryAx"},
+		{"clashes with spec names", header + "theorem QuodSpec.stmt_1 (n : ℕ) : n + 0 = n := by\n  sorry\n\ntheorem stmt_1 (n : ℕ) : n + 0 = n := by\n  simp" + stmt2, false, ""},
 		{"does not compile", header + "theorem stmt_1 (n : ℕ) : n + 0 = n := by\n  exact foo" + stmt2, false, "does not compile"},
 	}
 	for _, c := range cases {
@@ -84,7 +85,7 @@ func TestVerifier(t *testing.T) {
 				if c.badStmt1 != "" && !strings.Contains(s1.Error+strings.Join(s1.Axioms, ","), c.badStmt1) {
 					t.Errorf("stmt_1 error %q (axioms %v), want mention of %q", s1.Error, s1.Axioms, c.badStmt1)
 				}
-				if c.name != "does not compile" && !s2.OK {
+				if c.name != "does not compile" && c.name != "clashes with spec names" && !s2.OK {
 					t.Errorf("honest stmt_2 rejected: %+v", s2)
 				}
 			}

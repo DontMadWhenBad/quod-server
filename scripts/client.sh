@@ -6,16 +6,31 @@
 #   echo "..." | scripts/client.sh prove -
 #   scripts/client.sh list | watch ID | result ID | status ID | cancel ID
 #   scripts/client.sh confirm ID STMT yes|no|"correction text"
+#   scripts/client.sh -s http://host:8080 prove "..."      # pick the server
+#
+# Global options (before the command):
+#   -s, --server URL  server base URL (overrides PROVER_URL)
 #
 # Environment:
 #   PROVER_URL  server base URL (default http://127.0.0.1:8080)
 #   API_TOKEN   bearer token, if the server requires one
 set -euo pipefail
 
-URL="${PROVER_URL:-http://127.0.0.1:8080}"
-URL="${URL%/}"
-
 die() { printf 'client: %s\n' "$*" >&2; exit 1; }
+
+URL="${PROVER_URL:-http://127.0.0.1:8080}"
+while (( $# )); do
+  case $1 in
+    -s|--server)
+      [[ $# -ge 2 && -n $2 ]] || die "$1 needs a URL"
+      URL=$2; shift 2 ;;
+    --server=*)
+      URL=${1#--server=}; shift ;;
+    *) break ;;
+  esac
+done
+URL="${URL%/}"
+[[ $URL == http://* || $URL == https://* ]] || die "server URL must start with http:// or https:// (got '$URL')"
 command -v curl >/dev/null || die "curl not found"
 command -v jq   >/dev/null || die "jq not found"
 
@@ -43,7 +58,7 @@ api() {
 }
 
 usage() {
-  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^set -e/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
 prove options:
@@ -74,14 +89,17 @@ elif .type == "statement_error" then "\(tag)Lean rejected the statement: \(.mess
 elif .type == "formalized" then
   "\(tag)formalized\n      theorem \(.statement.name) \(.statement.signature | one)\n      means: \(.statement.back_translation | one)"
 elif .type == "revising" then "\(tag)re-formalizing: \(.message)"
+elif .type == "attempt" and .attempt.stage == "auto" then
+  "\(tag)automation `\(.attempt.body)` ✓ verified"
 elif .type == "attempt" then .attempt as $a |
-  "\(tag)attempt \($a.session).\($a.n) "
+  "\(tag)[\($a.stage)] attempt \($a.session).\($a.n) "
   + (if $a.verified then "✓ verified" else "✗ " + (($a.error_kinds // []) | join(", ")) end)
-  + "  (llm \($a.llm_time | secs)s, lean \($a.lean_time | ms)ms, $\((($a.cost_usd // 0) * 10000 | round) / 10000))"
+  + "  (llm \($a.llm_time | secs)s, \($a.reasoning_tokens // 0) thinking tok, lean \($a.lean_time | ms)ms, $\((($a.cost_usd // 0) * 10000 | round) / 10000))"
   + (if $verbose and ($a.feedback // "") != "" then "\n" + ($a.feedback | split("\n") | map("      │ " + .) | join("\n")) else "" end)
 elif .type == "proved" then "\(tag)PROVED"
 elif .type == "failed" then "\(tag)FAILED: \(.statement.error // "")"
 elif .type == "explained" then "\(tag)explanation ready"
+elif .type == "stage" or .type == "automation" or .type == "thinking" then "\(tag)\(.message)"
 elif .type == "verifying" then "\(.message)…"
 elif .type == "verified" then "verified: \(.message)"
 elif .type == "error" then "\(tag)error: \(.message)"
@@ -96,7 +114,7 @@ color_for() {
     failed|error|statement_error) printf '%s' "$RED" ;;
     confirm_required|revising) printf '%s' "$YEL" ;;
     formalized) printf '%s' "$BLU" ;;
-    state|split|formalizing|explained) printf '%s' "$DIM" ;;
+    state|split|formalizing|explained|thinking|stage|automation) printf '%s' "$DIM" ;;
     *) printf '' ;;
   esac
 }

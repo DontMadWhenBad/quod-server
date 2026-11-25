@@ -34,20 +34,21 @@ type Deps struct {
 
 // Config bounds what clients can ask for. Zero values take defaults.
 type Config struct {
-	MaxRunning       int           // concurrent jobs; default 2
-	MaxQueued        int           // waiting jobs before ErrQueueFull; default 32
-	MaxInputBytes    int           // default 8192
-	MaxStatements    int           // per job; default 10
-	DefaultBudgetUSD float64       // default 0.25
-	MaxBudgetUSD     float64       // default 1.00
-	DailyBudgetUSD   float64       // across all jobs, per UTC day; default 5.00; <0 = unlimited
-	DefaultAttempts  int           // default 6
-	MaxAttempts      int           // default 12
-	MaxParallel      int           // default 4
-	JobTimeout       time.Duration // default 30m
-	ConfirmTimeout   time.Duration // default 30m
-	Retention        time.Duration // finished jobs kept; default 24h
-	MaxJobs          int           // finished jobs kept; default 1000
+	MaxRunning       int              // concurrent jobs; default 2
+	MaxQueued        int              // waiting jobs before ErrQueueFull; default 32
+	MaxInputBytes    int              // default 8192
+	MaxStatements    int              // per job; default 10
+	DefaultBudgetUSD float64          // default 0.25
+	MaxBudgetUSD     float64          // default 1.00
+	DailyBudgetUSD   float64          // across all jobs, per UTC day; default 5.00; <0 = unlimited
+	MaxAttempts      int              // default 12
+	MaxParallel      int              // default 4
+	JobTimeout       time.Duration    // default 30m
+	Stages           []pipeline.Stage // proof-search ladder; nil = pipeline.DefaultStages
+	NoAutomation     bool             // skip automation tactics before the LLM
+	ConfirmTimeout   time.Duration    // default 30m
+	Retention        time.Duration    // finished jobs kept; default 24h
+	MaxJobs          int              // finished jobs kept; default 1000
 }
 
 func (c Config) withDefaults() Config {
@@ -60,7 +61,6 @@ func (c Config) withDefaults() Config {
 	def(&c.MaxQueued, 32)
 	def(&c.MaxInputBytes, 8192)
 	def(&c.MaxStatements, 10)
-	def(&c.DefaultAttempts, 6)
 	def(&c.MaxAttempts, 12)
 	def(&c.MaxParallel, 4)
 	def(&c.MaxJobs, 1000)
@@ -133,11 +133,9 @@ func (m *Manager) Submit(input string, opts Options) (*Job, error) {
 	case opts.BudgetUSD < 0 || opts.Attempts < 0 || opts.Parallel < 0:
 		return nil, fmt.Errorf("%w: negative option", ErrInvalid)
 	}
-	if opts.Attempts == 0 {
-		opts.Attempts = m.cfg.DefaultAttempts
-	}
+	// 0 keeps the pipeline's stage ladder; > 0 overrides every stage.
 	opts.Attempts = min(opts.Attempts, m.cfg.MaxAttempts)
-	opts.Parallel = min(max(opts.Parallel, 1), m.cfg.MaxParallel)
+	opts.Parallel = min(opts.Parallel, m.cfg.MaxParallel)
 	if opts.BudgetUSD == 0 {
 		opts.BudgetUSD = m.cfg.DefaultBudgetUSD
 	}
@@ -205,6 +203,8 @@ func (m *Manager) run(ctx context.Context, cancel context.CancelFunc, j *Job) {
 		Models: m.deps.Models, LeanVersion: m.deps.LeanVersion, BudgetUSD: j.BudgetUSD,
 	})
 	p := pipeline.New(agent, checker, pipeline.Options{
+		Stages:           m.cfg.Stages,
+		NoAutomation:     m.cfg.NoAutomation,
 		MaxProofAttempts: j.Options.Attempts,
 		ParallelSessions: j.Options.Parallel,
 		SkipSplit:        j.Options.NoSplit,

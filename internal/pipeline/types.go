@@ -47,8 +47,11 @@ type StatementResult struct {
 
 // AttemptRecord is one proof attempt.
 type AttemptRecord struct {
-	Session    int           `json:"session"` // parallel session number, 1-based
-	N          int           `json:"n"`       // attempt number within session
+	Stage      string        `json:"stage"`   // ladder stage name, or "auto" for automation
+	Session    int           `json:"session"` // session number within the statement, 1-based (0 = automation)
+	N          int           `json:"n"`       // attempt number within session (automation: tactic index)
+	Model      string        `json:"model,omitempty"`
+	Effort     string        `json:"effort,omitempty"`
 	Body       string        `json:"body"`
 	Verified   bool          `json:"verified"`
 	ErrorKinds []string      `json:"error_kinds,omitempty"`
@@ -56,6 +59,9 @@ type AttemptRecord struct {
 	LLMTime    time.Duration `json:"llm_time"`
 	LeanTime   time.Duration `json:"lean_time"`
 	CostUSD    float64       `json:"cost_usd"`
+	// Token usage of the LLM call (reasoning is part of completion).
+	CompletionTokens int `json:"completion_tokens,omitempty"`
+	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
 }
 
 // Result of a whole job.
@@ -84,8 +90,11 @@ const (
 	EvProved         EventType = "proved"
 	EvFailed         EventType = "failed"
 	EvExplained      EventType = "explained"
-	EvVerifying      EventType = "verifying" // independent re-check started
-	EvVerified       EventType = "verified"  // independent re-check finished (Message: summary)
+	EvAutomation     EventType = "automation" // automation tactics tried (Message: outcome)
+	EvStage          EventType = "stage"      // proof search moved to a ladder stage
+	EvThinking       EventType = "thinking"   // LLM still generating (throttled progress)
+	EvVerifying      EventType = "verifying"  // independent re-check started
+	EvVerified       EventType = "verified"   // independent re-check finished (Message: summary)
 	EvDone           EventType = "done"
 	EvError          EventType = "error"
 )

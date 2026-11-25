@@ -8,7 +8,13 @@ Usage: `harness_verify TRUSTED_ROOTS SpecModule JobModule name₁ name₂ …`
 * `TRUSTED_ROOTS` is a `:`-separated list of directories holding read-only,
   trusted `.olean` files (toolchain, Mathlib, Harness).
 * `SpecModule` was compiled from the confirmed statements only
-  (`theorem nameᵢ <signature> := sorry`, importing nothing but Mathlib).
+  (`theorem SpecModule.nameᵢ <signature> := sorry` inside
+  `namespace SpecModule`, importing nothing but Mathlib).
+
+Both modules are loaded into one environment (Mathlib is loaded once). The
+spec's terms were elaborated in its own compilation, so nothing in the job
+can change them; a job that declares a `SpecModule.*` name fails to load
+and is rejected.
 * `JobModule` was compiled from the job's final Lean file.
 
 For every `nameᵢ` this program checks, using only data loaded from `.olean`
@@ -39,18 +45,26 @@ open Lean
 
 def allowedAxioms : List Name := [``propext, ``Classical.choice, ``Quot.sound]
 
-/-- Index of the job module. Fails if any other module lives outside the
-trusted roots. -/
-def checkImports (env : Environment) (jobMod : Name) (roots : Array System.FilePath) :
-    IO Nat := do
+/-- Indices of the spec and job modules. Fails if any other module lives
+outside the trusted roots, or if the job declares anything in the spec's
+namespace (Lean keeps only one of two clashing imported constants, so a job
+could otherwise replace the statement it is compared against). -/
+def checkImports (env : Environment) (specMod jobMod : Name) (roots : Array System.FilePath) :
+    IO (Nat × Nat) := do
   let some jobIdx := env.getModuleIdx? jobMod
     | throw <| IO.userError s!"job module {jobMod} not loaded"
-  for m in env.header.moduleNames, i in [0:env.header.moduleNames.size] do
-    if i == jobIdx.toNat then continue
+  let some specIdx := env.getModuleIdx? specMod
+    | throw <| IO.userError s!"spec module {specMod} not loaded"
+  if let some md := env.header.moduleData[jobIdx.toNat]? then
+    for c in md.constNames ++ md.extraConstNames do
+      if specMod.isPrefixOf c then
+        throw <| IO.userError s!"job declares {c} in the reserved namespace {specMod}"
+  for m in env.header.moduleNames do
+    if m == jobMod || m == specMod then continue
     let path ← IO.FS.realPath (← findOLean m)
     unless roots.any (fun r => (r.toString ++ "/").isPrefixOf path.toString) do
       throw <| IO.userError s!"untrusted module {m} imported from {path}"
-  return jobIdx.toNat
+  return (specIdx.toNat, jobIdx.toNat)
 
 /-- Axioms reachable from `root`, by walking every constant in its
 dependency closure. Iterative, so deep chains cannot overflow the stack.
@@ -79,19 +93,21 @@ def trustedAxioms (env : Environment) (root : Name) : Array Name × Nat := Id.ru
           stack := stack.push d
   return (found.toArray.qsort Name.lt, visited.size)
 
-def checkOne (spec job : Environment) (jobIdx : Nat) (n : Name) : Json := Id.run do
+def checkOne (env : Environment) (specMod : Name) (specIdx jobIdx : Nat) (n : Name) : Json := Id.run do
   let fail (msg : String) : Json :=
     Json.mkObj [("name", toJson n.toString), ("ok", toJson false), ("error", toJson msg)]
-  let some sci := spec.find? n | return fail "not in spec"
-  let some jci := job.find? n | return fail "not found in job"
+  let some sci := env.find? (specMod ++ n) | return fail "not in spec"
+  if (env.getModuleIdxFor? (specMod ++ n)).map (·.toNat) != some specIdx then
+    return fail "spec constant does not come from the spec module"
+  let some jci := env.find? n | return fail "not found in job"
   let .thmInfo jt := jci | return fail "not a theorem in job"
-  if (job.getModuleIdxFor? n).map (·.toNat) != some jobIdx then
+  if (env.getModuleIdxFor? n).map (·.toNat) != some jobIdx then
     return fail "not declared in the job module"
   if jt.levelParams != sci.levelParams then
     return fail "universe parameters differ from the confirmed statement"
   if jt.type != sci.type then
     return fail "type differs from the confirmed statement"
-  let (axs, walked) := trustedAxioms job n
+  let (axs, walked) := trustedAxioms env n
   let bad := axs.filter (fun a => !allowedAxioms.contains a)
   let base := [("name", toJson n.toString), ("axioms", toJson (axs.map (·.toString))),
     ("walked", toJson walked)]
@@ -111,19 +127,23 @@ def main (args : List String) : IO UInt32 := do
   let phase (what : String) : IO Unit := do
     if (← IO.getEnv "HARNESS_VERIFY_TIMING").isSome then
       IO.eprintln s!"[{(← IO.monoMsNow) - t0} ms] {what}"
-  -- leakEnv: never free the environments (freeing Mathlib twice takes
-  -- about a minute and the process exits right after anyway).
-  let spec ← importModules #[{ module := specMod.toName }] {} (loadExts := false) (leakEnv := true)
-  phase "imported spec"
-  let job ← importModules #[{ module := jobMod.toName }] {} (loadExts := false) (leakEnv := true)
-  phase "imported job"
-  let jobIdx ← try checkImports job jobMod.toName roots catch e =>
+  -- leakEnv: never free the environment (freeing Mathlib takes a long
+  -- time and the process exits right after anyway).
+  let env ← try
+      importModules #[{ module := specMod.toName }, { module := jobMod.toName }] {}
+        (loadExts := false) (leakEnv := true)
+    catch e =>
+      -- e.g. the job declares a name that clashes with the spec
+      IO.println (Json.mkObj [("ok", toJson false), ("error", toJson s!"loading failed: {e}")]).compress
+      return 1
+  phase "imported spec + job"
+  let (specIdx, jobIdx) ← try checkImports env specMod.toName jobMod.toName roots catch e =>
     IO.println (Json.mkObj [("ok", toJson false), ("error", toJson e.toString)]).compress
     return 1
   phase "checked imports"
   let mut allOk := true
   for n in names do
-    let r := checkOne spec job jobIdx n.toName
+    let r := checkOne env specMod.toName specIdx jobIdx n.toName
     IO.println r.compress
     phase s!"checked {n}"
     if r.getObjValD "ok" != toJson true then
