@@ -46,6 +46,9 @@ func NewPool(ctx context.Context, cfg PoolConfig) (*Pool, error) {
 		cfg.Size = 1
 	}
 	cfg.Config = cfg.Config.withDefaults()
+	if err := cfg.Sandbox.Check(); err != nil {
+		return nil, err
+	}
 	if cfg.Env == nil {
 		env, err := ResolveEnv(ctx, cfg.ProjectDir)
 		if err != nil {
@@ -107,6 +110,65 @@ func (p *Pool) Release(r *REPL) {
 		return
 	}
 	p.idle <- r // buffered to Size; never blocks
+}
+
+// Discard closes a worker instead of returning it and starts a
+// replacement in the background. Use it for any worker that ran code from
+// a job that must not influence later jobs.
+func (p *Pool) Discard(r *REPL) {
+	p.retire(r)
+	if p.ctx.Err() == nil {
+		p.wg.Add(1)
+		go p.replace()
+	}
+}
+
+// Lease gives one job exclusive, fresh workers. Workers are acquired
+// lazily on first use and discarded (never reused) on Close, so nothing a
+// job runs can affect another job. If the worker dies mid-job (e.g. a
+// timeout killed it), the next REPL call takes a fresh one; snapshots are
+// replayed there automatically.
+func (p *Pool) Lease() *Lease { return &Lease{p: p} }
+
+// Lease is exclusive use of workers by one job. Safe for concurrent use.
+type Lease struct {
+	p      *Pool
+	mu     sync.Mutex
+	cur    *REPL
+	closed bool
+}
+
+// REPL returns the job's live worker, acquiring a fresh one if needed.
+func (l *Lease) REPL(ctx context.Context) (*REPL, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil, errors.New("lean: lease closed")
+	}
+	if l.cur != nil && !l.cur.Dead() {
+		return l.cur, nil
+	}
+	if l.cur != nil {
+		l.p.Discard(l.cur)
+		l.cur = nil
+	}
+	r, err := l.p.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	l.cur = r
+	return r, nil
+}
+
+// Close discards the job's worker. Safe to call more than once.
+func (l *Lease) Close() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.cur != nil {
+		l.p.Discard(l.cur)
+		l.cur = nil
+	}
+	l.closed = true
 }
 
 // With runs fn on an acquired worker and releases it afterwards.

@@ -6,6 +6,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"mathprover/internal/lean"
@@ -119,25 +120,56 @@ type Checker interface {
 	CheckProof(ctx context.Context, base *lean.Snapshot, s lean.Statement, body string) (*lean.Outcome, error)
 }
 
-// PoolChecker runs checks on a lean.Pool, one worker per check.
-type PoolChecker struct{ Pool *lean.Pool }
-
-func (c PoolChecker) CheckStatement(ctx context.Context, base *lean.Snapshot, s lean.Statement) (*lean.StatementCheck, error) {
-	var out *lean.StatementCheck
-	err := c.Pool.With(ctx, func(r *lean.REPL) error {
-		var err error
-		out, err = lean.CheckStatement(ctx, r, base, s)
-		return err
-	})
-	return out, err
+// CheckerSource hands out a Checker for one job; release ends it.
+type CheckerSource interface {
+	JobChecker(ctx context.Context) (c Checker, release func(), err error)
 }
 
-func (c PoolChecker) CheckProof(ctx context.Context, base *lean.Snapshot, s lean.Statement, body string) (*lean.Outcome, error) {
-	var out *lean.Outcome
-	err := c.Pool.With(ctx, func(r *lean.REPL) error {
-		var err error
-		out, err = lean.CheckProof(ctx, r, base, s, body)
-		return err
+// PoolSource gives every job its own lease on fresh pool workers, which
+// are discarded when the job ends (see lean.Lease). This is what isolates
+// jobs from each other.
+type PoolSource struct{ Pool *lean.Pool }
+
+func (s PoolSource) JobChecker(context.Context) (Checker, func(), error) {
+	l := s.Pool.Lease()
+	return LeaseChecker{Lease: l}, l.Close, nil
+}
+
+// StaticSource returns the same Checker for every job (tests, trusted use).
+type StaticSource struct{ C Checker }
+
+func (s StaticSource) JobChecker(context.Context) (Checker, func(), error) {
+	return s.C, func() {}, nil
+}
+
+// LeaseChecker runs checks on a job's leased worker.
+type LeaseChecker struct{ Lease *lean.Lease }
+
+func (c LeaseChecker) CheckStatement(ctx context.Context, base *lean.Snapshot, s lean.Statement) (*lean.StatementCheck, error) {
+	return withRetry(ctx, c.Lease, func(r *lean.REPL) (*lean.StatementCheck, error) {
+		return lean.CheckStatement(ctx, r, base, s)
 	})
-	return out, err
+}
+
+func (c LeaseChecker) CheckProof(ctx context.Context, base *lean.Snapshot, s lean.Statement, body string) (*lean.Outcome, error) {
+	return withRetry(ctx, c.Lease, func(r *lean.REPL) (*lean.Outcome, error) {
+		return lean.CheckProof(ctx, r, base, s, body)
+	})
+}
+
+// withRetry runs fn once more on a fresh worker if the current one died
+// before or while replaying (e.g. killed by another session's timeout).
+func withRetry[T any](ctx context.Context, l *lean.Lease, fn func(*lean.REPL) (T, error)) (T, error) {
+	var zero T
+	for attempt := 0; ; attempt++ {
+		r, err := l.REPL(ctx)
+		if err != nil {
+			return zero, err
+		}
+		out, err := fn(r)
+		if err != nil && errors.Is(err, lean.ErrDead) && attempt == 0 && ctx.Err() == nil {
+			continue
+		}
+		return out, err
+	}
 }

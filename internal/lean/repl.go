@@ -7,10 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,7 +44,10 @@ type Config struct {
 	CmdTimeout time.Duration
 	// Env is the process environment. If nil it is resolved once via
 	// `lake env` (see ResolveEnv), so the REPL runs without a lake wrapper.
+	// It is always passed through ScrubEnv before use.
 	Env []string
+	// Sandbox isolates the process. The zero value means no sandbox.
+	Sandbox Sandbox
 }
 
 func (c Config) withDefaults() Config {
@@ -76,8 +77,9 @@ func (c Config) withDefaults() Config {
 }
 
 // ResolveEnv returns the environment `lake env` would set up for the
-// project (LEAN_PATH, LEAN_SYSROOT, ...). Running the REPL directly with this
-// environment avoids keeping a `lake` process alive per worker.
+// project (LEAN_PATH, LEAN_SYSROOT, ...), scrubbed of everything else (see
+// ScrubEnv). Running the REPL directly with this environment avoids keeping
+// a `lake` process alive per worker.
 func ResolveEnv(ctx context.Context, projectDir string) ([]string, error) {
 	cmd := exec.CommandContext(ctx, "lake", "env", "env", "-0")
 	cmd.Dir = projectDir
@@ -93,7 +95,7 @@ func ResolveEnv(ctx context.Context, projectDir string) ([]string, error) {
 			env = append(env, string(kv))
 		}
 	}
-	return env, nil
+	return ScrubEnv(env), nil
 }
 
 // REPL drives one leanprover-community/repl process. Methods are safe for
@@ -127,10 +129,15 @@ func Start(ctx context.Context, cfg Config) (*REPL, error) {
 		cfg.Env = env
 	}
 
+	cfg.Env = ScrubEnv(cfg.Env) // idempotent; also covers caller-supplied Env
+	argv, env, err := cfg.Sandbox.command(cfg, cfg.REPLBin)
+	if err != nil {
+		return nil, err
+	}
 	// Not CommandContext: the process outlives ctx, which only bounds startup.
-	cmd := exec.Command(cfg.REPLBin)
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = cfg.ProjectDir
-	cmd.Env = cfg.Env
+	cmd.Env = env
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -202,26 +209,14 @@ func (r *REPL) Commands() int {
 // Age is the time since the process started.
 func (r *REPL) Age() time.Duration { return time.Since(r.started) }
 
-// RSS returns the resident memory of the process in bytes (Linux only;
-// returns 0 elsewhere or on error).
+// RSS returns the resident memory of the REPL process tree in bytes
+// (Linux only; 0 elsewhere). Shared, file-backed pages (mapped .olean files)
+// are counted in full, so this overstates the per-worker cost.
 func (r *REPL) RSS() int64 {
 	if r.cmd.Process == nil {
 		return 0
 	}
-	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", r.cmd.Process.Pid))
-	if err != nil {
-		return 0
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if rest, ok := strings.CutPrefix(line, "VmRSS:"); ok {
-			f := strings.Fields(rest) // "123456 kB"
-			if len(f) >= 1 {
-				kb, _ := strconv.ParseInt(f[0], 10, 64)
-				return kb * 1024
-			}
-		}
-	}
-	return 0
+	return treeRSS(r.cmd.Process.Pid)
 }
 
 // ExecOptions tunes one Exec call.

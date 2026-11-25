@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"mathprover/internal/llm"
+	"mathprover/internal/pipeline"
 )
 
 // failingChat makes every job fail fast after spending cost.
@@ -15,6 +16,9 @@ type failingChat struct{ cost float64 }
 func (f failingChat) Chat(context.Context, llm.Request) (*llm.Response, error) {
 	return &llm.Response{Content: "not json", CostUSD: f.cost}, nil
 }
+
+// noLean is never reached: failingChat makes formalization fail first.
+var noLean = pipeline.StaticSource{}
 
 func waitTerminal(t *testing.T, j *Job) {
 	t.Helper()
@@ -29,7 +33,7 @@ func waitTerminal(t *testing.T, j *Job) {
 
 func TestDailyBudget(t *testing.T) {
 	// Each job: split (bad json → fallback) + formalize (no theorem) x3 → 4 calls at $0.30.
-	m := NewManager(Deps{Chatter: failingChat{cost: 0.30}, Models: llm.DefaultModels()},
+	m := NewManager(Deps{Chatter: failingChat{cost: 0.30}, Checkers: noLean, Models: llm.DefaultModels()},
 		Config{DailyBudgetUSD: 1.0, MaxBudgetUSD: 5, DefaultBudgetUSD: 5})
 	defer m.Shutdown(context.Background())
 
@@ -50,7 +54,7 @@ func TestDailyBudget(t *testing.T) {
 }
 
 func TestPrune(t *testing.T) {
-	m := NewManager(Deps{Chatter: failingChat{}, Models: llm.DefaultModels()}, Config{MaxJobs: 2, Retention: time.Hour})
+	m := NewManager(Deps{Chatter: failingChat{}, Checkers: noLean, Models: llm.DefaultModels()}, Config{MaxJobs: 2, Retention: time.Hour})
 	defer m.Shutdown(context.Background())
 	var js []*Job
 	for range 4 {
@@ -76,7 +80,7 @@ func TestPrune(t *testing.T) {
 }
 
 func TestShutdownRejectsNewJobs(t *testing.T) {
-	m := NewManager(Deps{Chatter: failingChat{}, Models: llm.DefaultModels()}, Config{})
+	m := NewManager(Deps{Chatter: failingChat{}, Checkers: noLean, Models: llm.DefaultModels()}, Config{})
 	if err := m.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}

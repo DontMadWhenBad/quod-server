@@ -25,8 +25,8 @@ var (
 
 // Deps are the shared resources every job uses.
 type Deps struct {
-	Chatter     llm.Chatter      // one HTTP client shared by all jobs
-	Checker     pipeline.Checker // usually PoolChecker over one lean.Pool
+	Chatter     llm.Chatter            // one HTTP client shared by all jobs
+	Checkers    pipeline.CheckerSource // per-job Lean access; PoolSource isolates jobs
 	Models      llm.Models
 	LeanVersion string
 }
@@ -193,10 +193,17 @@ func (m *Manager) run(ctx context.Context, cancel context.CancelFunc, j *Job) {
 	j.setStateLocked(StateRunning)
 	j.mu.Unlock()
 
+	checker, release, err := m.deps.Checkers.JobChecker(ctx)
+	if err != nil {
+		j.finish(nil, fmt.Errorf("lean: %w", err), m.base.Err() != nil)
+		return
+	}
+	defer release() // the job's workers are discarded, never reused
+
 	agent := llm.NewAgent(m.deps.Chatter, llm.Options{
 		Models: m.deps.Models, LeanVersion: m.deps.LeanVersion, BudgetUSD: j.BudgetUSD,
 	})
-	p := pipeline.New(agent, m.deps.Checker, pipeline.Options{
+	p := pipeline.New(agent, checker, pipeline.Options{
 		MaxProofAttempts: j.Options.Attempts,
 		ParallelSessions: j.Options.Parallel,
 		SkipSplit:        j.Options.NoSplit,

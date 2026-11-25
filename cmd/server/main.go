@@ -32,7 +32,10 @@ func main() {
 		addr        = flag.String("addr", "127.0.0.1:8080", "listen address")
 		leanDir     = flag.String("lean-dir", "lean_env", "Lake project with Mathlib")
 		envFile     = flag.String("env", ".env", "dotenv file (DEEPSEEK_API_KEY, API_TOKEN)")
-		workers     = flag.Int("workers", 1, "Lean REPL workers (each ~7GB RAM)")
+		workers     = flag.Int("workers", 2, "warm Lean REPL workers; each job leases one and it is discarded afterwards (~0.5-1GB private RAM each + ~5GB shared)")
+		sandboxKind = flag.String("sandbox", "bwrap", "Lean process isolation: bwrap | none (none only for trusted input)")
+		sandboxMem  = flag.String("sandbox-mem", "10G", "memory limit per Lean worker (systemd scope); empty = none")
+		sandboxPids = flag.Int("sandbox-tasks", 256, "process/thread limit per Lean worker; 0 = none")
 		maxRunning  = flag.Int("max-running", 2, "jobs running at once")
 		maxQueued   = flag.Int("max-queued", 32, "jobs waiting before 429")
 		model       = flag.String("model", llm.ModelFlash, "prover model")
@@ -90,10 +93,14 @@ func main() {
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Info("starting Lean workers", "workers", *workers)
+	log.Info("starting Lean workers", "workers", *workers, "sandbox", *sandboxKind)
 	t0 := time.Now()
+	sb := sandboxConfig(*sandboxKind, *sandboxMem, *sandboxPids)
+	if sb.Kind == lean.SandboxNone {
+		log.Warn("Lean sandbox disabled: model-written Lean can read files and secrets on this host")
+	}
 	pool, err := lean.NewPool(sigCtx, lean.PoolConfig{
-		Config:      lean.Config{ProjectDir: *leanDir},
+		Config:      lean.Config{ProjectDir: *leanDir, Sandbox: sb},
 		Size:        *workers,
 		MaxCommands: 500,
 		Logger:      log,
@@ -105,7 +112,7 @@ func main() {
 
 	mgr := jobs.NewManager(jobs.Deps{
 		Chatter:     client,
-		Checker:     pipeline.PoolChecker{Pool: pool},
+		Checkers:    pipeline.PoolSource{Pool: pool},
 		Models:      models,
 		LeanVersion: leanVersion(*leanDir),
 	}, jobs.Config{
@@ -132,6 +139,19 @@ func main() {
 	_ = httpSrv.Shutdown(hctx)
 	pool.Close()
 	log.Info("bye")
+}
+
+func sandboxConfig(kind, mem string, tasks int) lean.Sandbox {
+	switch lean.SandboxKind(kind) {
+	case lean.SandboxNone:
+		return lean.Sandbox{Kind: lean.SandboxNone}
+	case lean.SandboxBwrap:
+		return lean.Sandbox{Kind: lean.SandboxBwrap, MemoryMax: mem, TasksMax: tasks}
+	default:
+		fmt.Fprintf(os.Stderr, "unknown -sandbox %q (want bwrap or none)\n", kind)
+		os.Exit(2)
+		return lean.Sandbox{}
+	}
 }
 
 func leanVersion(dir string) string {

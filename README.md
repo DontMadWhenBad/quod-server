@@ -49,7 +49,9 @@ echo "..." | ./bin/prove -json    # machine-readable result
 | `-attempts` | 6 | proof attempts per session |
 | `-parallel` | 1 | proof sessions racing per statement |
 | `-budget` | 0.50 | USD cap for the run/session |
-| `-workers` | 1 | Lean REPL processes |
+| `-workers` | 1 | warm Lean workers (each job gets a fresh one; use 2 with `-i`) |
+| `-sandbox` | `bwrap` | Lean isolation: `bwrap` or `none` (trusted input only) |
+| `-sandbox-mem`, `-sandbox-tasks` | `10G`, 256 | per-worker memory and process/thread limits |
 | `-confirm`, `-no-split`, `-no-explain`, `-json`, `-timeout`, `-lean-dir`, `-env` | | see `-h` |
 
 ## HTTP server
@@ -102,7 +104,8 @@ Set `PROVER_URL` (default `http://127.0.0.1:8080`) and `API_TOKEN` if needed.
 
 ```sh
 go test ./internal/...                                          # unit tests (no Lean, no API)
-LEAN_INTEGRATION=1 go test -v ./internal/lean/                  # real Lean REPL (~5 s)
+LEAN_INTEGRATION=1 go test -v ./internal/lean/                  # real Lean REPL + sandbox escape tests (~25 s)
+LEAN_INTEGRATION=1 LEAN_SANDBOX_MEMTEST=1 go test -v -run TestSandbox ./internal/lean/   # + memory bomb (needs >10 GB free)
 DEEPSEEK_LIVE=1 go test -v -run TestLive ./internal/llm/        # real API (< $0.01)
 ```
 
@@ -157,7 +160,34 @@ scripts/client.sh     example API client
 
 ## Security
 
-Lean can run arbitrary code at elaboration time, so LLM output is untrusted.
-`forbidden.go` blocks the obvious vectors, but it is **not a sandbox**.
-Before exposing this to other users, run Lean workers in an isolated
-container: no network, read-only filesystem, CPU and memory limits.
+Lean can run arbitrary code at elaboration time (`#eval`, custom
+elaborators, `unsafe`), and users can steer what the LLM writes, so every
+Lean process is treated as running hostile code. Defenses, outermost first:
+
+1. **One process per job.** A job leases fresh workers and they are killed
+   when it ends, never reused (`lean.Lease`). Warm spares hide the ~3 s
+   startup. Mathlib's 5 GB of `.olean` files are shared through the page
+   cache, so each extra worker costs ~0.5 GB of private memory.
+2. **Sandbox per process** (`-sandbox bwrap`, the default), using
+   bubblewrap and a systemd user scope:
+   - fresh user, pid, net, ipc and uts namespaces, so there is no network
+   - toolchain and `lean_env` mounted read-only, so nothing persistent can be
+     tampered with (e.g. `Harness.olean`)
+   - a private tmpfs `/tmp`, and no other host paths except `/usr`
+   - cgroup limits: `MemoryMax` (no swap) and `TasksMax`
+3. **Scrubbed environment.** Lean only sees `LEAN_*`, a toolchain-only
+   `PATH` and `LD_LIBRARY_PATH`, and `HOME=/tmp`. API keys never reach it.
+4. **Forbidden-syntax filter** (`forbidden.go`) and the axiom check at a
+   server-controlled line. These are fast feedback, not a security boundary.
+
+`internal/lean/sandbox_test.go` checks each channel against a live sandbox:
+secrets, host files, `/proc`, writes to `lean_env`, network, task limits,
+`/tmp` shared between workers, worker reuse, and optionally a memory bomb.
+
+Requirements: `bwrap` with unprivileged user namespaces, and a systemd user
+session for the limits. On a headless server run
+`loginctl enable-linger $USER`.
+
+Not covered yet: a kernel-level escape from the namespaces (add gVisor or a
+microVM for public deployments), and verifying the final proof
+independently of the job's own environment.

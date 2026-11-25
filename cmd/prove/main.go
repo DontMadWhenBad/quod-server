@@ -29,7 +29,10 @@ func main() {
 	var (
 		leanDir   = flag.String("lean-dir", "lean_env", "Lake project with Mathlib (see scripts/bootstrap.sh)")
 		envFile   = flag.String("env", ".env", "dotenv file with DEEPSEEK_API_KEY")
-		workers   = flag.Int("workers", 1, "Lean REPL workers (each ~7GB RAM)")
+		workers   = flag.Int("workers", 1, "warm Lean workers; each job gets a fresh one (use 2 in -i mode to skip the ~4s restart between jobs)")
+		sandbox   = flag.String("sandbox", "bwrap", "Lean process isolation: bwrap | none")
+		sbMem     = flag.String("sandbox-mem", "10G", "memory limit per Lean worker; empty = none")
+		sbTasks   = flag.Int("sandbox-tasks", 256, "process/thread limit per Lean worker; 0 = none")
 		model     = flag.String("model", llm.ModelFlash, "prover model: deepseek-flash | deepseek-v4-pro")
 		effort    = flag.String("effort", "high", "prover reasoning effort: low | high | max")
 		attempts  = flag.Int("attempts", 6, "proof attempts per session")
@@ -82,8 +85,12 @@ func main() {
 
 	progress("starting %d Lean worker(s) (imports Mathlib)...", *workers)
 	t0 := time.Now()
+	sb := lean.Sandbox{Kind: lean.SandboxKind(*sandbox), MemoryMax: *sbMem, TasksMax: *sbTasks}
+	if sb.Kind == lean.SandboxNone {
+		sb = lean.Sandbox{Kind: lean.SandboxNone}
+	}
 	pool, err := lean.NewPool(ctx, lean.PoolConfig{
-		Config:      lean.Config{ProjectDir: *leanDir},
+		Config:      lean.Config{ProjectDir: *leanDir, Sandbox: sb},
 		Size:        *workers,
 		MaxCommands: 500,
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -94,12 +101,13 @@ func main() {
 	defer pool.Close()
 	progress("Lean ready in %s", time.Since(t0).Round(100*time.Millisecond))
 
-	p := pipeline.New(agent, pipeline.PoolChecker{Pool: pool}, pipeline.Options{
+	src := pipeline.PoolSource{Pool: pool} // each job gets fresh, discarded workers
+	popts := pipeline.Options{
 		MaxProofAttempts: *attempts,
 		ParallelSessions: *parallel,
 		SkipSplit:        *noSplit,
 		NoExplain:        *noExplain,
-	})
+	}
 	hooks := pipeline.Hooks{OnEvent: func(e pipeline.Event) { printEvent(e, *verbose) }}
 	if *confirm {
 		hooks.Confirm = terminalConfirm(stdin, fromStdin)
@@ -112,7 +120,12 @@ func main() {
 		defer jstop()
 		jctx, cancel := context.WithTimeout(jctx, *timeout)
 		defer cancel()
-		res, err := p.Run(jctx, input, hooks)
+		checker, release, err := src.JobChecker(jctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+		res, err := pipeline.New(agent, checker, popts).Run(jctx, input, hooks)
 		if *asJSON {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")

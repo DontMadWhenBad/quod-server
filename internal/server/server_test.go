@@ -90,7 +90,7 @@ type harness struct {
 func newHarness(t *testing.T, cfg jobs.Config, token string) *harness {
 	t.Helper()
 	f := &fakeLLM{}
-	mgr := jobs.NewManager(jobs.Deps{Chatter: f, Checker: fakeLean{}, Models: llm.DefaultModels()}, cfg)
+	mgr := jobs.NewManager(jobs.Deps{Chatter: f, Checkers: pipeline.StaticSource{C: fakeLean{}}, Models: llm.DefaultModels()}, cfg)
 	srv := &Server{Token: token, Log: discardLogger(), Heartbeat: 50 * time.Millisecond}
 	srv.SetManager(mgr)
 	ts := httptest.NewServer(srv.Handler())
