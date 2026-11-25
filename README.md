@@ -24,6 +24,7 @@ cp .env.example .env    # then set DEEPSEEK_API_KEY=...
 
 # 3. Build
 go build -o bin/prove ./cmd/prove
+go build -o bin/server ./cmd/server
 ```
 
 `bootstrap.sh` is idempotent; rerun it after changing versions. Lean,
@@ -51,6 +52,52 @@ echo "..." | ./bin/prove -json    # machine-readable result
 | `-workers` | 1 | Lean REPL processes |
 | `-confirm`, `-no-split`, `-no-explain`, `-json`, `-timeout`, `-lean-dir`, `-env` | | see `-h` |
 
+## HTTP server
+
+```sh
+./bin/server -addr 127.0.0.1:8080        # loads Lean once, then serves jobs
+```
+
+| Endpoint | |
+|---|---|
+| `POST /v1/jobs` | `{"input": "...", "options": {...}}` → 202 + job view |
+| `GET /v1/jobs` | job summaries, newest first |
+| `GET /v1/jobs/{id}` | full job state (`?detail=full` adds Lean feedback) |
+| `GET /v1/jobs/{id}/events` | SSE progress stream; resume with `Last-Event-ID` or `?after=N` |
+| `POST /v1/jobs/{id}/confirm` | `{"stmt": 1, "accept": true}` or `{"stmt": 1, "correction": "..."}` |
+| `POST /v1/jobs/{id}/cancel` | cancel a queued or running job |
+| `GET /healthz`, `GET /readyz` | liveness; readiness (Lean loaded) and stats |
+
+Job options: `confirm`, `budget_usd`, `attempts`, `parallel`, `no_split`, `no_explain`.
+Job states: `queued → running ⇄ awaiting_confirmation → done | failed | canceled`.
+
+```sh
+ID=$(curl -s localhost:8080/v1/jobs -H 'Content-Type: application/json' \
+  -d '{"input": "For all real x, x^2 >= 0."}' | jq -r .id)
+curl -N localhost:8080/v1/jobs/$ID/events      # live progress
+curl -s localhost:8080/v1/jobs/$ID | jq        # result
+```
+
+Example client (bash + curl + jq) with live progress, confirmations at the
+terminal, reconnect on dropped streams, and Ctrl-C to cancel:
+
+```sh
+scripts/client.sh prove "For all real x, x^2 >= 0."
+scripts/client.sh prove --confirm -v "1) ... 2) ..."
+scripts/client.sh list | watch ID | result ID | status ID | cancel ID
+```
+
+Set `PROVER_URL` (default `http://127.0.0.1:8080`) and `API_TOKEN` if needed.
+
+- **Limits:** `-max-running`, `-max-queued` (429 when full), `-job-budget`,
+  `-max-job-budget`, `-daily-budget`, `-job-timeout`. Input is capped at 8 KB
+  and 10 statements.
+- **Auth:** set `API_TOKEN` in `.env` to require `Authorization: Bearer <token>`.
+  There is none by default, so keep the server on localhost.
+- **Storage:** jobs live in memory, are kept for 24 h, and are lost on restart.
+- **Shutdown:** on Ctrl-C or SIGTERM the server stops accepting jobs, waits
+  `-grace` for running ones, cancels the rest, then exits.
+
 ## Tests
 
 ```sh
@@ -63,6 +110,7 @@ DEEPSEEK_LIVE=1 go test -v -run TestLive ./internal/llm/        # real API (< $0
 
 ```
 cmd/prove/            CLI driver for the pipeline
+cmd/server/           HTTP API server
 internal/
   lean/               Lean source
     repl.go             one REPL process: JSON protocol, timeouts, env cache
@@ -79,10 +127,13 @@ internal/
     tasks.go            split, formalize, back-translate, prove sessions, explain
     extract.go          code/signature extraction from replies
   pipeline/           orchestration: statement chaining, repair loop, events, confirm hook
+  jobs/               job manager: queue, limits, budgets, event log, confirm hand-off
+  server/             HTTP handlers, SSE, auth
   dotenv/             .env loader
 lean_env/             Lake project: Mathlib + REPL + Harness
   Harness/AxiomCheck.lean   #harness_axioms command
 scripts/bootstrap.sh  environment setup
+scripts/client.sh     example API client
 ```
 
 ## How it works

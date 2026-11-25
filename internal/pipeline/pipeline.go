@@ -20,6 +20,7 @@ type Options struct {
 	ParallelSessions     int  // independent proof sessions racing; default 1
 	SkipSplit            bool // treat the whole input as one statement
 	NoExplain            bool
+	MaxStatements        int // reject inputs that split into more; 0 = unlimited
 	// LeanHeader starts LeanFile; default "import Mathlib\nimport Harness".
 	LeanHeader string
 	Feedback   lean.FeedbackOptions
@@ -43,6 +44,9 @@ func (o Options) withDefaults() Options {
 	}
 	return o
 }
+
+// ErrTooManyStatements is returned when the input exceeds MaxStatements.
+var ErrTooManyStatements = errors.New("too many statements")
 
 // Pipeline is reusable and safe for concurrent jobs.
 type Pipeline struct {
@@ -85,6 +89,11 @@ func (p *Pipeline) Run(ctx context.Context, input string, hooks Hooks) (*Result,
 
 	texts, err := j.split(ctx, input)
 	if err != nil {
+		j.emit(Event{Type: EvError, Message: err.Error()})
+		return j.res, err
+	}
+	if limit := p.opts.MaxStatements; limit > 0 && len(texts) > limit {
+		err := fmt.Errorf("%w: input has %d statements, limit is %d", ErrTooManyStatements, len(texts), limit)
 		j.emit(Event{Type: EvError, Message: err.Error()})
 		return j.res, err
 	}
