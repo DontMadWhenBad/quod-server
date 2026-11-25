@@ -27,6 +27,7 @@ var (
 type Deps struct {
 	Chatter     llm.Chatter            // one HTTP client shared by all jobs
 	Checkers    pipeline.CheckerSource // per-job Lean access; PoolSource isolates jobs
+	Verifier    pipeline.Verifier      // independent final check; nil disables it
 	Models      llm.Models
 	LeanVersion string
 }
@@ -209,6 +210,7 @@ func (m *Manager) run(ctx context.Context, cancel context.CancelFunc, j *Job) {
 		SkipSplit:        j.Options.NoSplit,
 		NoExplain:        j.Options.NoExplain,
 		MaxStatements:    m.cfg.MaxStatements,
+		Verifier:         m.deps.Verifier,
 	})
 	hooks := pipeline.Hooks{OnEvent: j.onPipelineEvent}
 	if j.Options.Confirm {

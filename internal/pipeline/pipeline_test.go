@@ -296,3 +296,81 @@ func TestContextCanceled(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// fakeVerifier rejects the names in reject, or fails entirely with err.
+type fakeVerifier struct {
+	reject map[string]bool
+	err    error
+	code   string
+	items  []lean.VerifyItem
+}
+
+func (f *fakeVerifier) Verify(_ context.Context, code string, items []lean.VerifyItem) (*lean.VerifyReport, error) {
+	f.code, f.items = code, items
+	if f.err != nil {
+		return nil, f.err
+	}
+	rep := &lean.VerifyReport{KernelOK: true, OK: true}
+	for _, it := range items {
+		v := lean.VerifiedItem{Name: it.Name, OK: !f.reject[it.Name], Axioms: []string{"propext"}}
+		if !v.OK {
+			v.Error = "type differs from the confirmed statement"
+			rep.OK = false
+		}
+		rep.Items = append(rep.Items, v)
+	}
+	return rep, nil
+}
+
+func TestIndependentVerification(t *testing.T) {
+	script := func() *fakeLLM {
+		return &fakeLLM{
+			split:  `{"statements": ["a", "b"]}`,
+			formal: []string{formal("stmt_1", ": 1 = 1"), formal("stmt_2", ": 2 = 2")},
+			proofs: []string{proof("good"), proof("good")},
+		}
+	}
+
+	// accepted: statuses stay proved, verdicts attached, file passed through
+	fv := &fakeVerifier{}
+	res, err, events := run(t, script(), &fakeLean{}, Options{NoExplain: true, Verifier: fv}, Hooks{}, "a b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fv.items) != 2 || fv.items[1].Signature != ": 2 = 2" || !strings.HasPrefix(fv.code, "import Mathlib\nimport Harness\n\ntheorem stmt_1") {
+		t.Errorf("verifier input: items=%+v code=%q", fv.items, fv.code)
+	}
+	for _, s := range res.Statements {
+		if s.Status != StatusProved || s.Verification == nil || !s.Verification.OK {
+			t.Errorf("%s = %+v", s.Name, s)
+		}
+	}
+	var sawVerified bool
+	for _, e := range events {
+		sawVerified = sawVerified || (e.Type == EvVerified && strings.Contains(e.Message, "2/2"))
+	}
+	if !sawVerified || res.Verification == nil {
+		t.Error("missing verified event or report")
+	}
+
+	// one rejected: it becomes failed, the other stays proved
+	res, _, events = run(t, script(), &fakeLean{}, Options{NoExplain: true, Verifier: &fakeVerifier{reject: map[string]bool{"stmt_2": true}}}, Hooks{}, "a b")
+	if res.Statements[0].Status != StatusProved || res.Statements[1].Status != StatusFailed ||
+		!strings.Contains(res.Statements[1].Error, "independent verification rejected") {
+		t.Errorf("statements: %+v / %+v", res.Statements[0], res.Statements[1])
+	}
+	if last := events[len(events)-1]; last.Message != "1/2 proved" {
+		t.Errorf("summary = %q", last.Message)
+	}
+
+	// verifier cannot run: fail closed as unverified, never proved
+	res, err, _ = run(t, script(), &fakeLean{}, Options{NoExplain: true, Verifier: &fakeVerifier{err: errors.New("bwrap missing")}}, Hooks{}, "a b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range res.Statements {
+		if s.Status != StatusUnverified || !strings.Contains(s.Error, "bwrap missing") {
+			t.Errorf("%s = %+v", s.Name, s)
+		}
+	}
+}

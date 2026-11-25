@@ -104,7 +104,7 @@ Set `PROVER_URL` (default `http://127.0.0.1:8080`) and `API_TOKEN` if needed.
 
 ```sh
 go test ./internal/...                                          # unit tests (no Lean, no API)
-LEAN_INTEGRATION=1 go test -v ./internal/lean/                  # real Lean REPL + sandbox escape tests (~25 s)
+LEAN_INTEGRATION=1 go test -v ./internal/lean/                  # real Lean: REPL, sandbox escapes, verifier vs. cheats (~8 min)
 LEAN_INTEGRATION=1 LEAN_SANDBOX_MEMTEST=1 go test -v -run TestSandbox ./internal/lean/   # + memory bomb (needs >10 GB free)
 DEEPSEEK_LIVE=1 go test -v -run TestLive ./internal/llm/        # real API (< $0.01)
 ```
@@ -177,8 +177,26 @@ Lean process is treated as running hostile code. Defenses, outermost first:
    - cgroup limits: `MemoryMax` (no swap) and `TasksMax`
 3. **Scrubbed environment.** Lean only sees `LEAN_*`, a toolchain-only
    `PATH` and `LD_LIBRARY_PATH`, and `HOME=/tmp`. API keys never reach it.
-4. **Forbidden-syntax filter** (`forbidden.go`) and the axiom check at a
-   server-controlled line. These are fast feedback, not a security boundary.
+4. **Independent final verification** (`-verify`, on by default). The
+   in-job check runs next to the job's own code, which could shadow it.
+   So when a job finishes, three fresh sandboxes re-derive the result
+   (`internal/lean/verify.go`, ~30 s):
+   - compile the confirmed statements alone (`theorem stmt_n <sig> := sorry`,
+     only `import Mathlib`), and separately compile the job's final file;
+   - `leanchecker` re-checks every declaration of the job in Lean's kernel;
+   - `harness_verify` (`lean_env/HarnessVerify.lean`) runs no job code. It
+     checks that each `stmt_n` is a theorem whose type is identical to the
+     separately compiled statement, so notation or instance tricks don't
+     count. It walks the dependency closure for axioms, allowing only
+     `propext`, `Classical.choice` and `Quot.sound`, without trusting
+     Lean's cached axiom data. And it rejects any imported module outside
+     the read-only toolchain, Mathlib or Harness locations.
+
+   A proof the verifier rejects becomes `failed`. If verification cannot
+   run, the statement is `unverified`, never `proved`.
+5. **Forbidden-syntax filter** (`forbidden.go`) and the in-job axiom check.
+   These give fast feedback during attempts; they are not a security
+   boundary.
 
 `internal/lean/sandbox_test.go` checks each channel against a live sandbox:
 secrets, host files, `/proc`, writes to `lean_env`, network, task limits,
@@ -188,6 +206,5 @@ Requirements: `bwrap` with unprivileged user namespaces, and a systemd user
 session for the limits. On a headless server run
 `loginctl enable-linger $USER`.
 
-Not covered yet: a kernel-level escape from the namespaces (add gVisor or a
-microVM for public deployments), and verifying the final proof
-independently of the job's own environment.
+Not covered: a kernel-level escape from the namespaces. Add gVisor or a
+microVM for public deployments.

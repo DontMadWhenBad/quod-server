@@ -16,3 +16,8 @@ rev = "v4.36.0"
 # so it builds fast and does not need Mathlib.
 [[lean_lib]]
 name = "Harness"
+
+# Trusted final checker (see HarnessVerify.lean). Imports only core Lean.
+[[lean_exe]]
+name = "harness_verify"
+root = "HarnessVerify"

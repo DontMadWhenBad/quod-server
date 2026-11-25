@@ -45,6 +45,7 @@ func main() {
 		asJSON    = flag.Bool("json", false, "print the result as JSON")
 		verbose   = flag.Bool("v", false, "print Lean feedback for failed attempts")
 		interact  = flag.Bool("i", false, "interactive: keep Lean loaded and prompt for statements repeatedly")
+		verify    = flag.Bool("verify", true, "independently re-check proofs at the end (kernel + axiom audit, ~30s)")
 	)
 	flag.Parse()
 
@@ -102,7 +103,16 @@ func main() {
 	progress("Lean ready in %s", time.Since(t0).Round(100*time.Millisecond))
 
 	src := pipeline.PoolSource{Pool: pool} // each job gets fresh, discarded workers
+	var verifier pipeline.Verifier
+	if *verify {
+		v, err := lean.NewVerifier(ctx, lean.VerifierConfig{Config: lean.Config{ProjectDir: *leanDir, Sandbox: sb}})
+		if err != nil {
+			fatal("verifier: %v", err)
+		}
+		verifier = v
+	}
 	popts := pipeline.Options{
+		Verifier:         verifier,
 		MaxProofAttempts: *attempts,
 		ParallelSessions: *parallel,
 		SkipSplit:        *noSplit,
@@ -235,6 +245,10 @@ func printEvent(e pipeline.Event, verbose bool) {
 		progress("%sFAILED: %s", tag, e.Statement.Error)
 	case pipeline.EvExplained:
 		// shown in the final report
+	case pipeline.EvVerifying:
+		progress("%s%s...", tag, e.Message)
+	case pipeline.EvVerified:
+		progress("%sverified: %s", tag, e.Message)
 	default:
 		msg := e.Message
 		if msg != "" {
@@ -256,6 +270,9 @@ func printResult(res *pipeline.Result) {
 		}
 		if s.Proof != "" {
 			fmt.Printf("\nProof:\n%s\n", indent(s.Proof, "  "))
+		}
+		if v := s.Verification; v != nil && v.OK {
+			fmt.Printf("\nIndependently verified (kernel re-check; axioms: %s)\n", strings.Join(v.Axioms, ", "))
 		}
 		if s.Explanation != "" {
 			fmt.Printf("\nExplanation:\n%s\n", indent(s.Explanation, "  "))

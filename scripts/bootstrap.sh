@@ -71,6 +71,9 @@ Update lean_env/lean-toolchain to match, then re-run."
 log "Building Harness (axiom check)"
 lake build Harness
 
+log "Building harness_verify (independent final checker)"
+lake build harness_verify
+
 log "Building REPL"
 lake build REPL/repl
 REPL_BIN="$LEAN_ENV/.lake/packages/REPL/.lake/build/bin/repl"

@@ -22,24 +22,27 @@ const (
 	StatusProved      Status = "proved"
 	StatusFailed      Status = "failed"               // formalized, but no proof found
 	StatusUnformal    Status = "formalization_failed" // no Lean statement accepted
+	StatusUnverified  Status = "unverified"           // proof found, but independent verification could not run
 	StatusCanceled    Status = "canceled"
 )
 
 // StatementResult is everything known about one statement.
 type StatementResult struct {
-	Index              int             `json:"index"` // 1-based
-	Name               string          `json:"name"`  // Lean name, e.g. stmt_1
-	Text               string          `json:"text"`  // natural language
-	Signature          string          `json:"signature,omitempty"`
-	FormalizationNotes string          `json:"formalization_notes,omitempty"`
-	BackTranslation    string          `json:"back_translation,omitempty"`
-	Status             Status          `json:"status"`
-	Proof              string          `json:"proof,omitempty"`     // verified tactic script
-	LeanCode           string          `json:"lean_code,omitempty"` // verified theorem + axiom check
-	Axioms             string          `json:"axioms,omitempty"`
-	Explanation        string          `json:"explanation,omitempty"`
-	Attempts           []AttemptRecord `json:"attempts,omitempty"`
-	Error              string          `json:"error,omitempty"`
+	Index              int    `json:"index"` // 1-based
+	Name               string `json:"name"`  // Lean name, e.g. stmt_1
+	Text               string `json:"text"`  // natural language
+	Signature          string `json:"signature,omitempty"`
+	FormalizationNotes string `json:"formalization_notes,omitempty"`
+	BackTranslation    string `json:"back_translation,omitempty"`
+	Status             Status `json:"status"`
+	Proof              string `json:"proof,omitempty"`     // verified tactic script
+	LeanCode           string `json:"lean_code,omitempty"` // verified theorem + axiom check
+	Axioms             string `json:"axioms,omitempty"`
+	Explanation        string `json:"explanation,omitempty"`
+	// Verification is the independent re-check verdict (see lean.Verifier).
+	Verification *lean.VerifiedItem `json:"verification,omitempty"`
+	Attempts     []AttemptRecord    `json:"attempts,omitempty"`
+	Error        string             `json:"error,omitempty"`
 }
 
 // AttemptRecord is one proof attempt.
@@ -60,10 +63,12 @@ type Result struct {
 	Statements []*StatementResult `json:"statements"`
 	// LeanFile is a standalone file with every proved statement (and the
 	// unproved ones commented out), checkable with `lake env lean`.
-	LeanFile string        `json:"lean_file"`
-	CostUSD  float64       `json:"cost_usd"`
-	LLMCalls int           `json:"llm_calls"`
-	Duration time.Duration `json:"duration"`
+	LeanFile string `json:"lean_file"`
+	// Verification is the independent re-check of all proved statements.
+	Verification *lean.VerifyReport `json:"verification,omitempty"`
+	CostUSD      float64            `json:"cost_usd"`
+	LLMCalls     int                `json:"llm_calls"`
+	Duration     time.Duration      `json:"duration"`
 }
 
 // EventType names a progress event.
@@ -79,6 +84,8 @@ const (
 	EvProved         EventType = "proved"
 	EvFailed         EventType = "failed"
 	EvExplained      EventType = "explained"
+	EvVerifying      EventType = "verifying" // independent re-check started
+	EvVerified       EventType = "verified"  // independent re-check finished (Message: summary)
 	EvDone           EventType = "done"
 	EvError          EventType = "error"
 )
@@ -114,7 +121,12 @@ type Decision struct {
 // waiting for a client); honour ctx.
 type ConfirmFunc func(ctx context.Context, p Proposal) (Decision, error)
 
-// Checker runs Lean. PoolChecker is the real one; tests use fakes.
+// Verifier independently re-checks finished proofs (lean.Verifier).
+type Verifier interface {
+	Verify(ctx context.Context, leanFile string, items []lean.VerifyItem) (*lean.VerifyReport, error)
+}
+
+// Checker runs Lean during a job; tests use fakes.
 type Checker interface {
 	CheckStatement(ctx context.Context, base *lean.Snapshot, s lean.Statement) (*lean.StatementCheck, error)
 	CheckProof(ctx context.Context, base *lean.Snapshot, s lean.Statement, body string) (*lean.Outcome, error)

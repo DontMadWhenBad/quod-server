@@ -68,21 +68,35 @@ func (s Sandbox) Check() error {
 	return nil
 }
 
-// command builds argv for running bin inside the sandbox, and the
-// environment for the outermost process. cfg.Env must already be scrubbed.
-//
-// Without a sandbox the REPL gets cfg.Env directly. With bwrap, the
-// launcher (systemd-run/bwrap) gets only what it needs to reach the user's
-// systemd instance, and bwrap clears the environment and sets cfg.Env for
-// the REPL, so nothing else from the host passes through.
+// command builds argv for running the REPL binary inside the sandbox, and
+// the environment for the outermost process. cfg.Env must be scrubbed.
 func (s Sandbox) command(cfg Config, bin string) (argv, env []string, err error) {
+	return s.wrap(cfg, cfg.Env, cfg.ProjectDir, nil, []string{bin})
+}
+
+// mount is an extra host directory made visible inside the sandbox at the
+// same path.
+type mount struct {
+	path     string
+	writable bool
+}
+
+// wrap builds argv for running inner (argv[0] = absolute binary path) in
+// the sandbox with the given environment, working directory and extra
+// mounts, plus the environment for the outermost process.
+//
+// Without a sandbox the command gets innerEnv directly. With bwrap, the
+// launcher (systemd-run/bwrap) gets only what it needs to reach the user's
+// systemd instance, and bwrap clears the environment and sets innerEnv for
+// the sandboxed process, so nothing else from the host passes through.
+func (s Sandbox) wrap(cfg Config, innerEnv []string, cwd string, mounts []mount, inner []string) (argv, env []string, err error) {
 	if s.Kind == SandboxNone || s.Kind == "" {
-		return []string{bin}, cfg.Env, nil
+		return inner, innerEnv, nil
 	}
 	if s.Kind != SandboxBwrap {
 		return nil, nil, fmt.Errorf("lean: unknown sandbox %q", s.Kind)
 	}
-	sysroot := envValue(cfg.Env, "LEAN_SYSROOT")
+	sysroot := envValue(innerEnv, "LEAN_SYSROOT")
 	if sysroot == "" {
 		return nil, nil, errors.New("lean: LEAN_SYSROOT missing from environment; cannot sandbox")
 	}
@@ -107,7 +121,7 @@ func (s Sandbox) command(cfg Config, bin string) (argv, env []string, err error)
 	argv = append(argv,
 		"bwrap",
 		"--unshare-all",     // user, pid, net, ipc, uts, cgroup namespaces
-		"--die-with-parent", // the REPL dies when bwrap (or the server) dies
+		"--die-with-parent", // the sandboxed process dies when bwrap (or the server) dies
 		"--new-session",     // no access to the controlling terminal
 		"--cap-drop", "ALL",
 		"--ro-bind", "/usr", "/usr",
@@ -116,7 +130,7 @@ func (s Sandbox) command(cfg Config, bin string) (argv, env []string, err error)
 		"--tmpfs", "/tmp", // private, empty, gone with the process
 		"--clearenv",
 	)
-	for _, kv := range cfg.Env {
+	for _, kv := range innerEnv {
 		if k, v, ok := strings.Cut(kv, "="); ok {
 			argv = append(argv, "--setenv", k, v)
 		}
@@ -143,7 +157,16 @@ func (s Sandbox) command(cfg Config, bin string) (argv, env []string, err error)
 	for _, p := range ro {
 		argv = append(argv, "--ro-bind", p, p)
 	}
-	argv = append(argv, "--chdir", cfg.ProjectDir, "--", bin)
+	// Extra mounts come last so they appear on top of the /tmp tmpfs.
+	for _, m := range mounts {
+		flag := "--ro-bind"
+		if m.writable {
+			flag = "--bind"
+		}
+		argv = append(argv, flag, m.path, m.path)
+	}
+	argv = append(argv, "--chdir", cwd, "--")
+	argv = append(argv, inner...)
 	return argv, env, nil
 }
 

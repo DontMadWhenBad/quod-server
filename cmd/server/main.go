@@ -45,6 +45,7 @@ func main() {
 		dailyBudget = flag.Float64("daily-budget", 5.00, "USD cap across all jobs per UTC day (<0 = unlimited)")
 		jobTimeout  = flag.Duration("job-timeout", 30*time.Minute, "max duration of one job")
 		grace       = flag.Duration("grace", 30*time.Second, "on shutdown, wait this long for running jobs")
+		verify      = flag.Bool("verify", true, "independently re-check every proof in fresh sandboxes (kernel + axiom audit)")
 	)
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -110,9 +111,21 @@ func main() {
 	}
 	log.Info("Lean ready", "startup", time.Since(t0).Round(100*time.Millisecond))
 
+	var verifier pipeline.Verifier
+	if *verify {
+		v, err := lean.NewVerifier(sigCtx, lean.VerifierConfig{Config: lean.Config{ProjectDir: *leanDir, Sandbox: sb}})
+		if err != nil {
+			fatal(log, "verifier", err)
+		}
+		verifier = v
+	} else {
+		log.Warn("independent verification disabled: results rely on the in-job check only")
+	}
+
 	mgr := jobs.NewManager(jobs.Deps{
 		Chatter:     client,
 		Checkers:    pipeline.PoolSource{Pool: pool},
+		Verifier:    verifier,
 		Models:      models,
 		LeanVersion: leanVersion(*leanDir),
 	}, jobs.Config{

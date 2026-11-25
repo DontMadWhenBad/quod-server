@@ -24,6 +24,9 @@ type Options struct {
 	// LeanHeader starts LeanFile; default "import Mathlib\nimport Harness".
 	LeanHeader string
 	Feedback   lean.FeedbackOptions
+	// Verifier, if set, re-checks every proved statement independently at
+	// the end of the job; a statement only stays "proved" if it passes.
+	Verifier Verifier
 }
 
 func (o Options) withDefaults() Options {
@@ -124,6 +127,11 @@ func (p *Pipeline) Run(ctx context.Context, input string, hooks Hooks) (*Result,
 		}
 		if sr.Signature != "" {
 			lemmas = append(lemmas, llm.Lemma{Name: sr.Name, Signature: sr.Signature, Text: sr.Text, Proved: sr.Status == StatusProved})
+		}
+	}
+	if p.opts.Verifier != nil && fatal == nil {
+		if err := j.verify(ctx, base); err != nil {
+			fatal = err
 		}
 	}
 	j.res.LeanFile = j.leanFile(base)
@@ -432,6 +440,59 @@ func (j *job) emit(e Event) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.hooks.OnEvent(e)
+}
+
+// verify re-checks all proved statements in fresh processes. Statements
+// it rejects become failed; if it cannot run, they become unverified.
+// Only cancellation is returned as an error.
+func (j *job) verify(ctx context.Context, base *lean.Snapshot) error {
+	var proved []*StatementResult
+	var items []lean.VerifyItem
+	for _, sr := range j.res.Statements {
+		if sr.Status == StatusProved {
+			proved = append(proved, sr)
+			items = append(items, lean.VerifyItem{Name: sr.Name, Signature: sr.Signature})
+		}
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	j.emit(Event{Type: EvVerifying, Message: fmt.Sprintf("independently re-checking %d proof(s)", len(items))})
+	code := j.p.opts.LeanHeader + "\n\n" + base.Code() + "\n"
+	rep, err := j.p.opts.Verifier.Verify(ctx, code, items)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		for _, sr := range proved {
+			j.setStatus(sr, StatusUnverified, "independent verification could not run: "+err.Error())
+		}
+		j.emit(Event{Type: EvError, Message: "independent verification could not run: " + err.Error()})
+		return nil
+	}
+	j.mu.Lock()
+	j.res.Verification = rep
+	rejected := 0
+	for _, sr := range proved {
+		it, ok := rep.Item(sr.Name)
+		if !ok {
+			it = lean.VerifiedItem{Name: sr.Name, Error: "missing from verification report"}
+		}
+		sr.Verification = &it
+		if !it.OK {
+			rejected++
+			sr.Status = StatusFailed
+			sr.Error = "independent verification rejected the proof: " + it.Error
+			if rep.Log != "" {
+				sr.Error += "\n" + rep.Log
+			}
+		}
+	}
+	j.mu.Unlock()
+	msg := fmt.Sprintf("%d/%d proof(s) confirmed by kernel re-check and axiom audit (%s)",
+		len(proved)-rejected, len(proved), rep.Duration.Round(100*time.Millisecond))
+	j.emit(Event{Type: EvVerified, Message: msg})
+	return nil
 }
 
 func (j *job) leanFile(base *lean.Snapshot) string {

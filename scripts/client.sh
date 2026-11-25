@@ -82,6 +82,8 @@ elif .type == "attempt" then .attempt as $a |
 elif .type == "proved" then "\(tag)PROVED"
 elif .type == "failed" then "\(tag)FAILED: \(.statement.error // "")"
 elif .type == "explained" then "\(tag)explanation ready"
+elif .type == "verifying" then "\(.message)…"
+elif .type == "verified" then "verified: \(.message)"
 elif .type == "error" then "\(tag)error: \(.message)"
 elif .type == "done" then "done: \(.message)"
 elif .type == "confirm_required" then "\(tag)waiting for confirmation"
@@ -90,7 +92,7 @@ JQ
 
 color_for() {
   case $1 in
-    proved|done) printf '%s' "$GRN" ;;
+    proved|done|verified) printf '%s' "$GRN" ;;
     failed|error|statement_error) printf '%s' "$RED" ;;
     confirm_required|revising) printf '%s' "$YEL" ;;
     formalized) printf '%s' "$BLU" ;;
@@ -174,6 +176,7 @@ print_result() { # $1 = job id
       "  \(.text | one)",
       (if .signature then "  Lean:  theorem \(.name) \(.signature | one)\n  Means: \(.back_translation // "" | one)" else empty end),
       (if .proof then "  Proof:\n\(.proof | ind)" else empty end),
+      (if .verification.ok then "  Independently verified (kernel re-check; axioms: \(.verification.axioms | join(", ")))" else empty end),
       (if .explanation then "  Explanation:\n\(.explanation | ind)" else empty end),
       (if .error and .status != "proved" then "  Error: \(.error)" else empty end),
       ""),
