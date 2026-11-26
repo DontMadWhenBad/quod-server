@@ -1,0 +1,32 @@
+# systemd user unit for the prover server.
+#
+# Install (as the user that owns the checkout at ~/quod-server):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/quod-server.service ~/.config/systemd/user/
+#   echo 'QUOD_ADDR=100.x.y.z:8080' > ~/.config/quod-server.env   # optional, default 127.0.0.1:8080
+#   loginctl enable-linger "$USER"        # start at boot without a login session
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now quod-server
+#
+# Control:  systemctl --user start|stop|restart|status quod-server
+# Logs:     journalctl --user -u quod-server -f
+
+[Unit]
+Description=quod prover server (Lean + DeepSeek)
+# Keep retrying forever: at boot the listen address (e.g. Tailscale) may not
+# exist yet; the server binds before loading Lean, so a failed start is cheap.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/quod-server
+Environment=QUOD_ADDR=127.0.0.1:8080
+EnvironmentFile=-%h/.config/quod-server.env
+ExecStart=%h/quod-server/bin/server -addr ${QUOD_ADDR}
+Restart=on-failure
+RestartSec=5
+# The server finishes running jobs for up to -grace (30s) on SIGTERM.
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
