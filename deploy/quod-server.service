@@ -4,6 +4,7 @@
 #   mkdir -p ~/.config/systemd/user
 #   cp deploy/quod-server.service ~/.config/systemd/user/
 #   echo 'QUOD_ADDR=100.x.y.z:8080' > ~/.config/quod-server.env   # optional, default 127.0.0.1:8080
+#   echo 'QUOD_FLAGS=-trusted-proxies 127.0.0.1,::1' >> ~/.config/quod-server.env   # optional extra flags
 #   loginctl enable-linger "$USER"        # start at boot without a login session
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now quod-server
@@ -21,8 +22,10 @@ StartLimitIntervalSec=0
 Type=simple
 WorkingDirectory=%h/quod-server
 Environment=QUOD_ADDR=127.0.0.1:8080
+Environment=QUOD_FLAGS=
 EnvironmentFile=-%h/.config/quod-server.env
-ExecStart=%h/quod-server/bin/server -addr ${QUOD_ADDR}
+# $QUOD_FLAGS (unbraced) is split into separate arguments.
+ExecStart=%h/quod-server/bin/server -addr ${QUOD_ADDR} $QUOD_FLAGS
 Restart=on-failure
 RestartSec=5
 # The server finishes running jobs for up to -grace (30s) on SIGTERM.
