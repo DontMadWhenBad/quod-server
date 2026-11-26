@@ -617,3 +617,62 @@ func TestPerKeyRateAndCaps(t *testing.T) {
 	}
 	close(h2.llm.gate)
 }
+
+func TestCORSHeaders(t *testing.T) {
+	store, _ := auth.OpenKeyStore(filepath.Join(t.TempDir(), "quod.db"))
+	defer store.Close()
+	k, _, _ := store.Create("web", 0)
+	cors, err := ParseCORSOrigins("https://me.github.io")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr := jobs.NewManager(jobs.Deps{Chatter: &fakeLLM{}, Checkers: pipeline.StaticSource{C: fakeLean{}}, Models: llm.DefaultModels()}, jobs.Config{})
+	srv := &Server{Auth: store, Log: discardLogger(), CORS: cors, Limits: Limits{UnauthPerMin: 1, UnauthBurst: 1}}
+	srv.SetManager(mgr)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	defer mgr.Shutdown(context.Background())
+
+	do := func(method, origin, authz string, hdr map[string]string) *http.Response {
+		req, _ := http.NewRequest(method, ts.URL+"/v1/status", nil)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		if authz != "" {
+			req.Header.Set("Authorization", "Bearer "+authz)
+		}
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp
+	}
+	// preflights never hit auth or rate limits, however many arrive
+	for range 3 {
+		resp := do("OPTIONS", "https://me.github.io", "", map[string]string{
+			"Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "authorization"})
+		if resp.StatusCode != 204 || resp.Header.Get("Access-Control-Allow-Origin") != "https://me.github.io" ||
+			!strings.Contains(resp.Header.Get("Access-Control-Allow-Headers"), "Authorization") {
+			t.Fatalf("preflight: %d %v", resp.StatusCode, resp.Header)
+		}
+	}
+	// actual request from the allowed origin gets CORS headers, credentials never
+	resp := do("GET", "https://me.github.io", k, nil)
+	if resp.StatusCode != 200 || resp.Header.Get("Access-Control-Allow-Origin") != "https://me.github.io" ||
+		resp.Header.Get("Access-Control-Allow-Credentials") != "" || !strings.Contains(resp.Header.Get("Access-Control-Expose-Headers"), "X-Request-ID") {
+		t.Errorf("allowed origin: %d %v", resp.StatusCode, resp.Header)
+	}
+	// other origins get no CORS headers (the browser blocks them)
+	resp = do("GET", "https://evil.example", k, nil)
+	if resp.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("foreign origin got CORS headers: %v", resp.Header)
+	}
+	resp = do("OPTIONS", "https://evil.example", "", map[string]string{"Access-Control-Request-Method": "GET"})
+	if resp.Header.Get("Access-Control-Allow-Origin") != "" || resp.StatusCode == 204 {
+		t.Errorf("foreign preflight: %d %v", resp.StatusCode, resp.Header)
+	}
+}

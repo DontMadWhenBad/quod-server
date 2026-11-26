@@ -110,3 +110,14 @@ func TestCounter(t *testing.T) {
 		t.Error("release should free a slot")
 	}
 }
+
+func TestCORS(t *testing.T) {
+	if _, err := ParseCORSOrigins("https://ok.example, http://localhost:8000"); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"ok.example", "https://ok.example/path", "ftp://x", "https://"} {
+		if _, err := ParseCORSOrigins(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}

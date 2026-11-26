@@ -36,6 +36,7 @@ func main() {
 		authMode    = flag.String("auth", "keys", "client authentication: keys (server-issued access keys) | none (development only)")
 		dbPath      = flag.String("db", "quod.db", "SQLite database with access keys (manage with: quod-admin keys ...)")
 		proxies     = flag.String("trusted-proxies", "", "comma-separated CIDRs/addresses of reverse proxies whose CF-Connecting-IP / X-Forwarded-For are trusted (e.g. 127.0.0.1,::1 for a local cloudflared)")
+		corsOrigins = flag.String("cors-origins", "", "comma-separated browser origins allowed to call the API (e.g. https://user.github.io)")
 		rateUnauth  = flag.Float64("rate-unauth", 20, "requests per minute per client IP without a valid key")
 		rateKey     = flag.Float64("rate-key", 120, "requests per minute per access key")
 		maxJobsKey  = flag.Int("max-jobs-per-key", 2, "queued + running jobs per access key")
@@ -69,6 +70,11 @@ func main() {
 		os.Exit(2)
 	}
 	trust, err := server.ParseTrustedProxies(*proxies)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "server:", err)
+		os.Exit(2)
+	}
+	cors, err := server.ParseCORSOrigins(*corsOrigins)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "server:", err)
 		os.Exit(2)
@@ -108,7 +114,7 @@ func main() {
 
 	// Listen first so /healthz answers while Lean loads; job endpoints
 	// return 503 until the pool is ready.
-	srv := &server.Server{Auth: authn, Log: log, Proxies: trust,
+	srv := &server.Server{Auth: authn, Log: log, Proxies: trust, CORS: cors,
 		Limits: server.Limits{UnauthPerMin: *rateUnauth, KeyPerMin: *rateKey, MaxStreamsPerKey: *maxStreams}}
 	httpSrv := &http.Server{
 		Addr:              *addr,

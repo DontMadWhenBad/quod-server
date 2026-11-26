@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>quod prover</title>
+  <meta name="description" content="Natural-language statements in, machine-checked Lean 4 proofs out.">
+  <link rel="stylesheet" href="style.css">
+  <!-- Math rendering for explanations (optional; the page works without it). -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" crossorigin="anonymous"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <h1>quod <span class="sub">prover</span></h1>
+    <div class="status" id="status" title="Connection and usage">not configured</div>
+    <button class="ghost" id="open-settings" aria-haspopup="dialog">Settings</button>
+  </header>
+
+  <main>
+    <section class="card" id="compose">
+      <label for="input" class="label">Statement(s) to prove</label>
+      <textarea id="input" rows="5" spellcheck="false"
+        placeholder="1) For every natural number n, n^3 - n is divisible by 3.&#10;2) For all positive reals a and b, (a + b)/2 >= sqrt(a*b)."></textarea>
+      <div class="row">
+        <span class="hint">Ctrl/⌘ + Enter to submit</span>
+        <span class="spacer"></span>
+        <button id="cancel" class="ghost danger" hidden>Cancel job</button>
+        <button id="submit" class="primary">Prove</button>
+      </div>
+    </section>
+
+    <section class="card" id="confirm" hidden aria-live="polite"></section>
+
+    <section class="card" id="progress-card" hidden>
+      <div class="row">
+        <h2>Progress</h2>
+        <span class="spacer"></span>
+        <span class="mono muted" id="job-id"></span>
+      </div>
+      <ol class="log" id="log"></ol>
+    </section>
+
+    <section id="result"></section>
+
+    <section class="card">
+      <div class="row">
+        <h2>Your jobs</h2>
+        <span class="spacer"></span>
+        <button class="ghost" id="refresh-jobs">Refresh</button>
+      </div>
+      <div id="jobs" class="muted">Configure the server and access key in Settings.</div>
+    </section>
+  </main>
+
+  <dialog id="settings">
+    <form method="dialog" id="settings-form">
+      <h2>Settings</h2>
+
+      <fieldset>
+        <legend>Connection</legend>
+        <label>Server URL
+          <input name="server" type="url" placeholder="https://your-server.example" required autocomplete="url">
+        </label>
+        <label>Access key
+          <span class="row tight">
+            <input name="key" type="password" placeholder="qk_…" autocomplete="off" spellcheck="false">
+            <button type="button" class="ghost" id="toggle-key">Show</button>
+          </span>
+        </label>
+        <label class="check"><input name="rememberKey" type="checkbox"> Remember the key on this device</label>
+        <p class="note">Without “remember”, the key is kept only for this tab. A remembered key sits in this
+          browser’s storage for this site, which every page under the same <code>*.github.io</code> origin can read —
+          only remember it on your own device.</p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Proving (same as <code>client.sh prove</code> options)</legend>
+        <label class="check"><input name="confirm" type="checkbox"> Confirm each formalization before proving <code>--confirm</code></label>
+        <label class="check"><input name="split" type="checkbox"> Split input into separate statements <span class="muted">(off = <code>--no-split</code>)</span></label>
+        <label class="check"><input name="explain" type="checkbox"> Write plain-language explanations <span class="muted">(off = <code>--no-explain</code>)</span></label>
+        <div class="grid3">
+          <label>Attempts <input name="attempts" type="number" min="0" max="12" step="1"><small>0 = server ladder</small></label>
+          <label>Parallel <input name="parallel" type="number" min="0" max="4" step="1"><small>0 = server ladder</small></label>
+          <label>Budget $ <input name="budget" type="number" min="0" max="1" step="0.05"><small>0 = server default</small></label>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Output</legend>
+        <label class="check"><input name="feedback" type="checkbox"> Show Lean feedback for failed attempts <code>-v</code></label>
+        <label class="check"><input name="raw" type="checkbox"> Raw output: server JSON as-is <code>--raw</code></label>
+      </fieldset>
+
+      <p class="error" id="settings-error" hidden></p>
+      <div class="row">
+        <button type="button" class="ghost danger" id="forget-key">Forget key</button>
+        <span class="spacer"></span>
+        <button type="button" class="ghost" id="close-settings">Close</button>
+        <button type="submit" class="primary" id="save-settings">Save &amp; test</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

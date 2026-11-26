@@ -44,6 +44,8 @@ type Server struct {
 	Limits Limits
 	// Proxies lists peers whose forwarding headers are believed.
 	Proxies ProxyTrust
+	// CORS lists browser origins allowed to call the API.
+	CORS CORS
 
 	manager atomic.Pointer[jobs.Manager]
 
@@ -73,7 +75,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/jobs/{id}/events", s.withManager(s.events))
 	mux.HandleFunc("POST /v1/jobs/{id}/confirm", s.withManager(s.confirm))
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.withManager(s.cancel))
-	return s.recoverer(s.logger(s.auth(mux)))
+	return s.recoverer(s.logger(s.cors(s.auth(mux))))
 }
 
 func (s *Server) log() *slog.Logger {

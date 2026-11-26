@@ -150,6 +150,29 @@ Pick the server with `-s URL` before the command (for example
 - **Shutdown:** on Ctrl-C or SIGTERM the server stops accepting jobs, waits
   `-grace` for running ones, cancels the rest, then exits.
 
+## Web client
+
+`web/` is a static page (plain HTML/CSS/JS, no build) that does what
+`client.sh` does. It lets you prove statements with live progress, confirm
+or correct formalizations, browse your jobs and download the Lean file.
+Settings mirror the `client.sh` options:
+
+- **Connection:** server URL and access key. The key is kept for the tab
+  only, unless you choose to remember it on the device.
+- **Proving:** confirm, split, explanations, attempts, parallel, budget.
+- **Output:** show Lean feedback (`-v`) and raw output (`--raw`).
+
+- **Publish:** `.github/workflows/pages.yml` deploys `web/` to GitHub Pages
+  on every push that touches it. One-time setup: repository Settings → Pages
+  → Source: GitHub Actions.
+- **Allow the page's origin on the server**, or the browser blocks its
+  requests: `-cors-origins https://<user>.github.io` (exact origins,
+  comma-separated). Pre-flight requests are answered before auth and rate
+  limits, and cookies are never allowed. The key travels only in the
+  `Authorization` header.
+- **Try it locally:** `python3 -m http.server 8000 -d web` and run the server
+  with `-cors-origins http://localhost:8000`.
+
 ## Running as a service
 
 `deploy/quod-server.service` is a systemd **user** unit. It assumes the
@@ -210,7 +233,8 @@ internal/
 lean_env/             Lake project: Mathlib + REPL + Harness
   Harness/AxiomCheck.lean   #harness_axioms command
 scripts/bootstrap.sh  environment setup
-scripts/client.sh     example API client
+scripts/client.sh     example API client (shell)
+web/                  example API client (browser, GitHub Pages)
 ```
 
 ## How it works
