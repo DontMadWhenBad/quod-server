@@ -62,6 +62,8 @@ type AttemptRecord struct {
 	// Token usage of the LLM call (reasoning is part of completion).
 	CompletionTokens int `json:"completion_tokens,omitempty"`
 	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
+	// ToolCalls the model made since the previous record (tool stages).
+	ToolCalls int `json:"tool_calls,omitempty"`
 }
 
 // Result of a whole job.
@@ -139,6 +141,11 @@ type Verifier interface {
 type Checker interface {
 	CheckStatement(ctx context.Context, base *lean.Snapshot, s lean.Statement) (*lean.StatementCheck, error)
 	CheckProof(ctx context.Context, base *lean.Snapshot, s lean.Statement, body string) (*lean.Outcome, error)
+	// ExploreProof is CheckProof that allows `sorry` placeholders and
+	// reports their goals (never verified); used by the check_proof tool.
+	ExploreProof(ctx context.Context, base *lean.Snapshot, s lean.Statement, body string) (*lean.Outcome, error)
+	// Query runs a read-only command (lookups for tools) on base.
+	Query(ctx context.Context, base *lean.Snapshot, code string, timeout time.Duration) (*lean.Result, error)
 }
 
 // CheckerSource hands out a Checker for one job; release ends it.
@@ -175,6 +182,18 @@ func (c LeaseChecker) CheckStatement(ctx context.Context, base *lean.Snapshot, s
 func (c LeaseChecker) CheckProof(ctx context.Context, base *lean.Snapshot, s lean.Statement, body string) (*lean.Outcome, error) {
 	return withRetry(ctx, c.Lease, func(r *lean.REPL) (*lean.Outcome, error) {
 		return lean.CheckProof(ctx, r, base, s, body)
+	})
+}
+
+func (c LeaseChecker) ExploreProof(ctx context.Context, base *lean.Snapshot, s lean.Statement, body string) (*lean.Outcome, error) {
+	return withRetry(ctx, c.Lease, func(r *lean.REPL) (*lean.Outcome, error) {
+		return lean.ExploreProof(ctx, r, base, s, body)
+	})
+}
+
+func (c LeaseChecker) Query(ctx context.Context, base *lean.Snapshot, code string, timeout time.Duration) (*lean.Result, error) {
+	return withRetry(ctx, c.Lease, func(r *lean.REPL) (*lean.Result, error) {
+		return r.Exec(ctx, base, code, lean.ExecOptions{Timeout: timeout})
 	})
 }
 

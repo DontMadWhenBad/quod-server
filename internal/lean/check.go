@@ -210,6 +210,17 @@ func (o *Outcome) Snapshot() *Snapshot {
 // the Verdict, not as a Go error, so the caller can feed them back. A
 // timeout kills the REPL; the caller must Release it to the pool.
 func CheckProof(ctx context.Context, r *REPL, base *Snapshot, s Statement, body string) (*Outcome, error) {
+	return checkProof(ctx, r, base, s, body, false)
+}
+
+// ExploreProof is CheckProof that also accepts `sorry` placeholders, for
+// tools: Result.Sorries then holds the open goal at each one. A proof with
+// sorry is never verified (Judge rejects the sorry warning).
+func ExploreProof(ctx context.Context, r *REPL, base *Snapshot, s Statement, body string) (*Outcome, error) {
+	return checkProof(ctx, r, base, s, body, true)
+}
+
+func checkProof(ctx context.Context, r *REPL, base *Snapshot, s Statement, body string, allowSorry bool) (*Outcome, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
@@ -217,7 +228,11 @@ func CheckProof(ctx context.Context, r *REPL, base *Snapshot, s Statement, body 
 	if a.Body == "" {
 		return rejected(a, synthetic(a.BodyLine, KindParse, "empty proof")), nil
 	}
-	if err := CheckForbidden(a.Body); err != nil {
+	var allow []string
+	if allowSorry {
+		allow = []string{"sorry", "admit"}
+	}
+	if err := CheckForbiddenAllow(a.Body, allow...); err != nil {
 		var fe *ForbiddenError
 		line := a.BodyLine
 		if errors.As(err, &fe) {

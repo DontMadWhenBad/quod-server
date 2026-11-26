@@ -112,7 +112,7 @@ elif .type == "attempt" and .attempt.stage == "auto" then
 elif .type == "attempt" then .attempt as $a |
   "\(tag)[\($a.stage)] attempt \($a.session).\($a.n) "
   + (if $a.verified then "✓ verified" else "✗ " + (($a.error_kinds // []) | join(", ")) end)
-  + "  (llm \($a.llm_time | secs)s, \($a.reasoning_tokens // 0) thinking tok, lean \($a.lean_time | ms)ms, $\((($a.cost_usd // 0) * 10000 | round) / 10000))"
+  + "  (llm \($a.llm_time | secs)s, \($a.reasoning_tokens // 0) thinking tok\(if ($a.tool_calls // 0) > 0 then ", \($a.tool_calls) tool calls" else "" end), lean \($a.lean_time | ms)ms, $\((($a.cost_usd // 0) * 10000 | round) / 10000))"
   + (if $verbose and ($a.feedback // "") != "" then "\n" + ($a.feedback | split("\n") | map("      │ " + .) | join("\n")) else "" end)
 elif .type == "proved" then "\(tag)PROVED"
 elif .type == "failed" then "\(tag)FAILED: \(.statement.error // "")"

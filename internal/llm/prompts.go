@@ -50,3 +50,13 @@ When you receive compiler feedback, fix the specific errors reported. If an appr
 const explainSystem = `You explain a formally verified proof to a reader who knows mathematics but not Lean.
 Give the key idea and main steps in plain mathematical language, concisely (a short paragraph or a few bullet points).
 Do not mention Lean syntax or tactic names unless it helps understanding.`
+
+const proveToolsAddendum = `
+
+You have Lean tools. Use them instead of guessing:
+- search_lemmas: find theorems by fragments of their name (e.g. "pow mod", "dvd sub"); returns names with statements.
+- check_name: confirm a lemma exists and see its exact statement before using it.
+- find_lemma: ask Lean's library search (exact?) to close a goal you state as "<binders> : <prop>".
+- check_proof: compile a candidate tactic script for the theorem; returns errors and remaining goals. If it succeeds you are done.
+Work in small steps: look up the facts you need, test partial proofs with check_proof, and fix what Lean reports.
+When you are confident, reply with the final tactic script in one lean code block (or simply call check_proof with it).`

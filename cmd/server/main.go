@@ -42,7 +42,8 @@ func main() {
 		maxRunning  = flag.Int("max-running", 2, "jobs running at once")
 		maxQueued   = flag.Int("max-queued", 32, "jobs waiting before 429")
 		model       = flag.String("model", llm.ModelFlash, "prover model")
-		effort      = flag.String("effort", "", "single stage at this effort (none|low|high|max) instead of the fast→think→deep ladder")
+		effort      = flag.String("effort", "", "single stage at this effort (none|low|high|max) instead of the ladder")
+		stagesArg   = flag.String("stages", strings.Join(pipeline.DefaultStageNames, ","), "proof-search ladder: comma-separated presets (fast, tools, tools-low, think, deep, deep-tools)")
 		noAuto      = flag.Bool("no-auto", false, "skip trying automation tactics before the LLM")
 		jobBudget   = flag.Float64("job-budget", 0.25, "default USD budget per job")
 		maxBudget   = flag.Float64("max-job-budget", 1.00, "max USD budget a client may request")
@@ -87,7 +88,11 @@ func main() {
 	}
 	models := llm.DefaultModels()
 	models.Prove = llm.ModelSpec{Model: *model, Effort: llm.EffortHigh}
-	stages := pipeline.DefaultStages(*model)
+	stages, err := pipeline.NamedStages(*model, strings.Split(*stagesArg, ","))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	if *effort != "" {
 		stages = []pipeline.Stage{{Name: *effort, Spec: llm.ModelSpec{Model: *model, Effort: llm.Effort(*effort)}, Sessions: 1, Attempts: 6}}
 	}

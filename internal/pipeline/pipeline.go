@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -58,21 +59,68 @@ type Stage struct {
 	Spec     llm.ModelSpec `json:"spec"`
 	Sessions int           `json:"sessions"` // parallel sessions racing
 	Attempts int           `json:"attempts"` // propose→check rounds per session
+	// Tools lets the model look up lemmas and test proofs in Lean while it
+	// works (search_lemmas, check_name, find_lemma, check_proof).
+	Tools        bool `json:"tools,omitempty"`
+	MaxToolCalls int  `json:"max_tool_calls,omitempty"` // per attempt; default 16
 }
 
-// DefaultStages escalates from many cheap, non-thinking attempts (Lean's
-// fast feedback does the checking) to fewer, deliberate ones. Measured on
-// easy Mathlib goals, thinking time is dominated by the model second-guessing
-// lemma names it cannot look up, not by the mathematics.
-func DefaultStages(model string) []Stage {
+// StagePresets are the named stages for model. "fast" is many cheap,
+// non-thinking attempts (Lean's fast feedback does the checking); "tools"
+// lets a non-thinking model look up lemmas and test proofs in Lean; "think"
+// and "deep" are slower, deliberate attempts ("deep" with tools too).
+// Measured on easy Mathlib goals, thinking time is dominated by the model
+// second-guessing lemma names it cannot look up, not by the mathematics.
+func StagePresets(model string) map[string]Stage {
 	if model == "" {
 		model = llm.ModelFlash
 	}
-	return []Stage{
-		{Name: "fast", Spec: llm.ModelSpec{Model: model, Effort: llm.EffortNone, MaxTokens: 4096}, Sessions: 4, Attempts: 3},
-		{Name: "think", Spec: llm.ModelSpec{Model: model, Effort: llm.EffortLow}, Sessions: 2, Attempts: 3},
-		{Name: "deep", Spec: llm.ModelSpec{Model: model, Effort: llm.EffortHigh}, Sessions: 2, Attempts: 4},
+	spec := func(e llm.Effort) llm.ModelSpec { return llm.ModelSpec{Model: model, Effort: e} }
+	fast := spec(llm.EffortNone)
+	fast.MaxTokens = 4096
+	return map[string]Stage{
+		"fast":       {Name: "fast", Spec: fast, Sessions: 4, Attempts: 3},
+		"tools":      {Name: "tools", Spec: spec(llm.EffortNone), Sessions: 2, Attempts: 3, Tools: true},
+		"tools-low":  {Name: "tools-low", Spec: spec(llm.EffortLow), Sessions: 2, Attempts: 3, Tools: true},
+		"think":      {Name: "think", Spec: spec(llm.EffortLow), Sessions: 2, Attempts: 3},
+		"deep":       {Name: "deep", Spec: spec(llm.EffortHigh), Sessions: 2, Attempts: 4},
+		"deep-tools": {Name: "deep-tools", Spec: spec(llm.EffortHigh), Sessions: 2, Attempts: 3, Tools: true},
 	}
+}
+
+// DefaultStageNames is the default ladder.
+var DefaultStageNames = []string{"fast", "tools", "deep-tools"}
+
+// DefaultStages is the default ladder on model.
+func DefaultStages(model string) []Stage {
+	st, _ := NamedStages(model, DefaultStageNames)
+	return st
+}
+
+// NamedStages builds a ladder from preset names (see StagePresets).
+func NamedStages(model string, names []string) ([]Stage, error) {
+	presets := StagePresets(model)
+	var out []Stage
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		st, ok := presets[n]
+		if !ok {
+			var known []string
+			for k := range presets {
+				known = append(known, k)
+			}
+			sort.Strings(known)
+			return nil, fmt.Errorf("unknown stage %q (known: %s)", n, strings.Join(known, ", "))
+		}
+		out = append(out, st)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no stages given")
+	}
+	return out, nil
 }
 
 func (p *Pipeline) stages() []Stage {
@@ -89,6 +137,9 @@ func (p *Pipeline) stages() []Stage {
 			s.Attempts = p.opts.MaxProofAttempts
 		}
 		s.Sessions, s.Attempts = max(s.Sessions, 1), max(s.Attempts, 1)
+		if s.Tools && s.MaxToolCalls <= 0 {
+			s.MaxToolCalls = 16
+		}
 		if s.Name == "" {
 			s.Name = fmt.Sprintf("stage%d", i+1)
 		}
@@ -479,19 +530,37 @@ func (j *job) runStage(ctx context.Context, sr *StatementResult, stmt lean.State
 // thinkingEvery throttles "thinking…" progress events per attempt.
 const thinkingEvery = 10 * time.Second
 
-// session runs one propose → check → feedback loop.
+// session runs one propose → check → feedback loop. In tool stages the
+// model may also look things up and test proofs (check_proof) inside an
+// attempt; every check_proof is recorded as an attempt of its own.
 func (j *job) session(ctx context.Context, sn int, st Stage, sr *StatementResult, stmt lean.Statement,
 	base *lean.Snapshot, in llm.ProveInput, failed *failedSet) (*lean.Outcome, error) {
 	sess := j.p.agent.NewProofSessionWith(in, st.Spec)
-	for k := 1; k <= st.Attempts; k++ {
+	n := 0 // attempt records so far
+	// acc collects LLM usage until the next record.
+	var acc AttemptRecord
+	newRec := func(body string) AttemptRecord {
+		n++
+		r := acc
+		acc = AttemptRecord{}
+		r.Stage, r.Session, r.N, r.Model, r.Effort, r.Body = st.Name, sn, n, st.Spec.Model, effortName(st.Spec.Effort), body
+		return r
+	}
+	addUsage := func(resp *llm.Response) {
+		acc.CostUSD += resp.CostUSD
+		acc.LLMTime += resp.Latency
+		acc.CompletionTokens += resp.Usage.CompletionTokens
+		acc.ReasoningTokens += resp.Usage.ReasoningTokens()
+	}
+
+	for round := 1; round <= st.Attempts; round++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		rec := AttemptRecord{Stage: st.Name, Session: sn, N: k, Model: st.Spec.Model, Effort: effortName(st.Spec.Effort)}
 		t0 := time.Now()
 		lastEmit := t0
 		var progMu sync.Mutex
-		body, resp, err := sess.NextProgress(ctx, func(p llm.Progress) {
+		progress := func(p llm.Progress) {
 			progMu.Lock()
 			defer progMu.Unlock()
 			if time.Since(lastEmit) < thinkingEvery {
@@ -499,27 +568,62 @@ func (j *job) session(ctx context.Context, sn int, st Stage, sr *StatementResult
 			}
 			lastEmit = time.Now()
 			j.emit(Event{Type: EvThinking, Stmt: sr.Index, Message: fmt.Sprintf("session %d attempt %d (%s): thinking… %d tokens after %s",
-				sn, k, st.Name, p.ReasoningChunks+p.ContentChunks, time.Since(t0).Round(time.Second))})
-		})
-		rec.LLMTime = time.Since(t0)
-		if resp != nil {
-			rec.CostUSD = resp.CostUSD
-			rec.CompletionTokens = resp.Usage.CompletionTokens
-			rec.ReasoningTokens = resp.Usage.ReasoningTokens()
+				sn, round, st.Name, p.ReasoningChunks+p.ContentChunks, time.Since(t0).Round(time.Second))})
 		}
-		if err != nil {
-			if fatalErr(ctx, err) {
-				return nil, err
+
+		var body string
+		var err error
+		if st.Tools {
+			tools := &leanTools{j: j, sr: sr, stmt: stmt, base: base, failed: failed}
+			lastCalls := 0
+			tools.rec = func(b string, o *lean.Outcome, leanTime time.Duration, repeated string) {
+				r := newRec(b)
+				r.ToolCalls, lastCalls = tools.calls-lastCalls, tools.calls
+				r.LeanTime = leanTime
+				switch {
+				case repeated != "":
+					r.ErrorKinds, r.Feedback = []string{"repeated"}, repeated
+				case o != nil:
+					r.Verified = o.Verdict.Verified
+					for _, d := range o.Verdict.Errors {
+						r.ErrorKinds = append(r.ErrorKinds, string(d.Kind))
+					}
+					if !r.Verified {
+						r.Feedback = lean.RenderFeedback(o, j.p.opts.Feedback)
+					}
+				}
+				j.record(sr, r)
 			}
-			if errors.Is(err, llm.ErrTruncated) {
-				rec.ErrorKinds = []string{"truncated"}
-				j.record(sr, rec)
+			var stopped bool
+			body, stopped, err = sess.NextTools(ctx, tools, st.MaxToolCalls, progress, addUsage)
+			if stopped && tools.win != nil {
+				return tools.win, nil
+			}
+			if err != nil && !fatalErr(ctx, err) && (errors.Is(err, llm.ErrNoAnswer) || errors.Is(err, llm.ErrTruncated)) {
+				r := newRec("")
+				r.ToolCalls = tools.calls - lastCalls
+				r.ErrorKinds = []string{map[bool]string{true: "no_answer", false: "truncated"}[errors.Is(err, llm.ErrNoAnswer)]}
+				j.record(sr, r)
+				continue // no pending reply; start the next round fresh
+			}
+		} else {
+			var resp *llm.Response
+			body, resp, err = sess.NextProgress(ctx, progress)
+			if resp != nil {
+				addUsage(resp)
+			}
+			if err != nil && !fatalErr(ctx, err) && errors.Is(err, llm.ErrTruncated) {
+				r := newRec("")
+				r.ErrorKinds = []string{"truncated"}
+				j.record(sr, r)
 				continue // the session has no pending reply; just ask again
 			}
-			return nil, err // non-transient API error after client retries
 		}
-		rec.Body = body
+		if err != nil {
+			return nil, err // fatal, or non-transient API error after client retries
+		}
 
+		rec := newRec(body)
 		norm := lean.NormalizeBody(body)
 		if fb, seen := failed.get(norm); seen {
 			rec.ErrorKinds = []string{"repeated"}
@@ -529,7 +633,6 @@ func (j *job) session(ctx context.Context, sn int, st Stage, sr *StatementResult
 			sess.Feedback(rec.Feedback)
 			continue
 		}
-
 		t1 := time.Now()
 		o, err := j.p.check.CheckProof(ctx, base, stmt, body)
 		rec.LeanTime = time.Since(t1)

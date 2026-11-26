@@ -34,7 +34,8 @@ func main() {
 		sbMem     = flag.String("sandbox-mem", "10G", "memory limit per Lean worker; empty = none")
 		sbTasks   = flag.Int("sandbox-tasks", 256, "process/thread limit per Lean worker; 0 = none")
 		model     = flag.String("model", llm.ModelFlash, "prover model: deepseek-flash | deepseek-v4-pro")
-		effort    = flag.String("effort", "", "single stage at this effort (none|low|high|max) instead of the fast→think→deep ladder")
+		effort    = flag.String("effort", "", "single stage at this effort (none|low|high|max) instead of the ladder")
+		stagesArg = flag.String("stages", strings.Join(pipeline.DefaultStageNames, ","), "proof-search ladder: comma-separated presets (fast, tools, tools-low, think, deep, deep-tools)")
 		attempts  = flag.Int("attempts", 0, "if > 0: proof attempts per session in every stage")
 		parallel  = flag.Int("parallel", 0, "if > 0: parallel proof sessions in every stage")
 		noAuto    = flag.Bool("no-auto", false, "skip trying automation tactics before the LLM")
@@ -81,7 +82,10 @@ func main() {
 	if *effort != "" {
 		stages = []pipeline.Stage{{Name: *effort, Spec: llm.ModelSpec{Model: *model, Effort: llm.Effort(*effort)}, Sessions: 1, Attempts: 6}}
 	} else {
-		stages = pipeline.DefaultStages(*model)
+		var err error
+		if stages, err = pipeline.NamedStages(*model, strings.Split(*stagesArg, ",")); err != nil {
+			fatal("%v", err)
+		}
 	}
 	leanVersion := "Lean 4 + Mathlib"
 	if tc, err := os.ReadFile(filepath.Join(*leanDir, "lean-toolchain")); err == nil {
@@ -247,8 +251,12 @@ func printEvent(e pipeline.Event, verbose bool) {
 			progress("%sautomation `%s` %s  (lean %s)", tag, a.Body, status, a.LeanTime.Round(time.Millisecond))
 			break
 		}
-		progress("%s[%s] attempt %d.%d %s  (llm %s, %d thinking tok, lean %s, $%.4f)", tag, a.Stage, a.Session, a.N, status,
-			a.LLMTime.Round(100*time.Millisecond), a.ReasoningTokens, a.LeanTime.Round(time.Millisecond), a.CostUSD)
+		tools := ""
+		if a.ToolCalls > 0 {
+			tools = fmt.Sprintf(", %d tool calls", a.ToolCalls)
+		}
+		progress("%s[%s] attempt %d.%d %s  (llm %s, %d thinking tok%s, lean %s, $%.4f)", tag, a.Stage, a.Session, a.N, status,
+			a.LLMTime.Round(100*time.Millisecond), a.ReasoningTokens, tools, a.LeanTime.Round(time.Millisecond), a.CostUSD)
 		if verbose && !a.Verified && a.Feedback != "" {
 			fmt.Fprintln(os.Stderr, indent(a.Feedback, "           │ "))
 		}

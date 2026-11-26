@@ -41,8 +41,41 @@ const (
 // Message is one chat turn. Reasoning from earlier turns is never sent back:
 // without tools the API ignores it anyway.
 type Message struct {
-	Role    string `json:"role"` // "system" | "user" | "assistant"
+	Role    string `json:"role"` // "system" | "user" | "assistant" | "tool"
 	Content string `json:"content"`
+	// ReasoningContent must be sent back on assistant messages when tools
+	// are in use (thinking mode); without tools the API ignores it.
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`   // assistant: calls requested
+	ToolCallID       string     `json:"tool_call_id,omitempty"` // tool: which call this answers
+}
+
+// Tool describes a function the model may call (OpenAI-compatible).
+type Tool struct {
+	Type     string       `json:"type"` // "function"
+	Function ToolFunction `json:"function"`
+}
+
+// ToolFunction is a tool's name, description and JSON-schema parameters.
+type ToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+// ToolCall is one call the model asked for. Arguments is a JSON object as text.
+type ToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"` // "function"
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// ToolResult builds the message answering a call.
+func ToolResult(callID, content string) Message {
+	return Message{Role: "tool", ToolCallID: callID, Content: content}
 }
 
 func System(s string) Message    { return Message{Role: "system", Content: s} }
@@ -57,6 +90,9 @@ type Request struct {
 	MaxTokens   int      // 0 = server default (64K in thinking mode)
 	JSON        bool     // response_format json_object; prompt must mention "json"
 	Temperature *float64 // ignored by the API in thinking mode
+	// Tools the model may call; the response then may carry ToolCalls
+	// (FinishReason "tool_calls") instead of a final answer.
+	Tools []Tool
 	// OnProgress, if set, makes the call stream and is invoked as output
 	// arrives (from the HTTP goroutine; keep it fast). The Response is the
 	// same as without streaming.
@@ -95,7 +131,8 @@ type Response struct {
 	Model        string
 	Content      string
 	Reasoning    string // chain of thought (thinking mode only)
-	FinishReason string // stop | length | content_filter | ...
+	ToolCalls    []ToolCall
+	FinishReason string // stop | length | tool_calls | content_filter | ...
 	Usage        Usage
 	CostUSD      float64
 	Latency      time.Duration
@@ -165,6 +202,7 @@ func NewClientFromEnv() (*Client, error) {
 type wireRequest struct {
 	Model           string          `json:"model"`
 	Messages        []Message       `json:"messages"`
+	Tools           []Tool          `json:"tools,omitempty"`
 	ReasoningEffort Effort          `json:"reasoning_effort,omitempty"`
 	MaxTokens       int             `json:"max_tokens,omitempty"`
 	ResponseFormat  *responseFormat `json:"response_format,omitempty"`
@@ -185,8 +223,9 @@ type wireResponse struct {
 	Model   string `json:"model"`
 	Choices []struct {
 		Message struct {
-			Content          *string `json:"content"`
-			ReasoningContent *string `json:"reasoning_content"`
+			Content          *string    `json:"content"`
+			ReasoningContent *string    `json:"reasoning_content"`
+			ToolCalls        []ToolCall `json:"tool_calls"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -204,6 +243,7 @@ func (c *Client) Chat(ctx context.Context, req Request) (*Response, error) {
 		ReasoningEffort: req.Effort,
 		MaxTokens:       req.MaxTokens,
 		Temperature:     req.Temperature,
+		Tools:           req.Tools,
 	}
 	if req.JSON {
 		wr.ResponseFormat = &responseFormat{Type: "json_object"}
@@ -323,7 +363,7 @@ func readJSON(body io.Reader) (*Response, error) {
 		return nil, &APIError{Message: "response has no choices", Retryable: true}
 	}
 	ch := wr.Choices[0]
-	r := &Response{Model: wr.Model, FinishReason: ch.FinishReason, Usage: wr.Usage}
+	r := &Response{Model: wr.Model, FinishReason: ch.FinishReason, Usage: wr.Usage, ToolCalls: ch.Message.ToolCalls}
 	if ch.Message.Content != nil {
 		r.Content = *ch.Message.Content
 	}
@@ -339,6 +379,15 @@ type streamChunk struct {
 		Delta struct {
 			Content          *string `json:"content"`
 			ReasoningContent *string `json:"reasoning_content"`
+			ToolCalls        []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -351,6 +400,7 @@ func readStream(body io.Reader, onProgress func(Progress)) (*Response, error) {
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 64<<10), 8<<20)
 	var content, reasoning strings.Builder
+	var calls []ToolCall
 	var p Progress
 	r := &Response{}
 	done := false
@@ -384,6 +434,23 @@ func readStream(body io.Reader, onProgress func(Progress)) (*Response, error) {
 				content.WriteString(*d)
 				p.ContentChunks++
 			}
+			// Tool calls stream as fragments keyed by index: the first carries
+			// id and name, later ones append to the arguments string.
+			for _, tc := range c.Delta.ToolCalls {
+				for len(calls) <= tc.Index {
+					calls = append(calls, ToolCall{Type: "function"})
+				}
+				cur := &calls[tc.Index]
+				if tc.ID != "" {
+					cur.ID = tc.ID
+				}
+				if tc.Type != "" {
+					cur.Type = tc.Type
+				}
+				cur.Function.Name += tc.Function.Name
+				cur.Function.Arguments += tc.Function.Arguments
+				p.ContentChunks++
+			}
 			if c.FinishReason != nil && *c.FinishReason != "" {
 				r.FinishReason = *c.FinishReason
 			}
@@ -396,7 +463,7 @@ func readStream(body io.Reader, onProgress func(Progress)) (*Response, error) {
 	if !done && r.FinishReason == "" {
 		return nil, &APIError{Message: "stream ended early", Retryable: true}
 	}
-	r.Content, r.Reasoning = content.String(), reasoning.String()
+	r.Content, r.Reasoning, r.ToolCalls = content.String(), reasoning.String(), calls
 	return r, nil
 }
 

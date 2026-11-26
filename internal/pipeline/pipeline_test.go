@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"mathprover/internal/lean"
 	"mathprover/internal/llm"
@@ -66,9 +67,10 @@ func proof(body string) string { return "```lean\n" + body + "\n```" }
 // fakeLean: signatures containing BAD fail to elaborate; proofs equal to
 // "good" (or "use_<name>" when <name> is in the base snapshot) verify.
 type fakeLean struct {
-	mu     sync.Mutex
-	proofs []string
-	bases  []string // base Code() seen per CheckProof
+	mu      sync.Mutex
+	proofs  []string
+	bases   []string // base Code() seen per CheckProof
+	queries []string // tool queries
 }
 
 func (f *fakeLean) CheckStatement(_ context.Context, base *lean.Snapshot, s lean.Statement) (*lean.StatementCheck, error) {
@@ -77,6 +79,17 @@ func (f *fakeLean) CheckStatement(_ context.Context, base *lean.Snapshot, s lean
 		return &lean.StatementCheck{Code: code, Errors: []lean.Diagnostic{{Message: lean.Message{Severity: "error", Pos: lean.Pos{Line: 1}, Data: "unknown identifier 'BAD'"}, Kind: lean.KindUnknownIdent}}}, nil
 	}
 	return &lean.StatementCheck{OK: true, Code: code, Snapshot: base.Extend(code)}, nil
+}
+
+func (f *fakeLean) ExploreProof(ctx context.Context, base *lean.Snapshot, s lean.Statement, body string) (*lean.Outcome, error) {
+	return f.CheckProof(ctx, base, s, body)
+}
+
+func (f *fakeLean) Query(_ context.Context, base *lean.Snapshot, code string, _ time.Duration) (*lean.Result, error) {
+	f.mu.Lock()
+	f.queries = append(f.queries, code)
+	f.mu.Unlock()
+	return &lean.Result{Messages: []lean.Message{{Severity: "info", Data: "result of " + code}}}, nil
 }
 
 func (f *fakeLean) CheckProof(_ context.Context, base *lean.Snapshot, s lean.Statement, body string) (*lean.Outcome, error) {
@@ -508,5 +521,105 @@ func TestRepeatsSharedAcrossSessions(t *testing.T) {
 	}
 	if len(fk.proofs) != 2 { // "bad" once, "good" once
 		t.Errorf("lean checks = %d", len(fk.proofs))
+	}
+}
+
+// toolChat scripts a tool-using prover: each reply is either tool calls or
+// final content. Other tasks (formalize etc.) are answered like fakeLLM.
+type toolChat struct {
+	fakeLLM
+	turns []llm.Response
+	seen  [][]llm.Message // messages of each prover request
+}
+
+func (c *toolChat) Chat(ctx context.Context, r llm.Request) (*llm.Response, error) {
+	if !strings.Contains(r.Messages[0].Content, "write tactic proofs") {
+		return c.fakeLLM.Chat(ctx, r)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(r.Tools) == 0 {
+		return nil, errors.New("tool stage request without tools")
+	}
+	c.seen = append(c.seen, r.Messages)
+	t := c.turns[0]
+	c.turns = c.turns[1:]
+	return &t, nil
+}
+
+func call(id, name, args string) llm.ToolCall {
+	tc := llm.ToolCall{ID: id, Type: "function"}
+	tc.Function.Name, tc.Function.Arguments = name, args
+	return tc
+}
+
+func TestToolStage(t *testing.T) {
+	tc := &toolChat{
+		fakeLLM: fakeLLM{formal: []string{formal("stmt_1", "(n : ℕ) : 3 ∣ n ^ 3 - n")}},
+		turns: []llm.Response{
+			{ToolCalls: []llm.ToolCall{call("c1", "search_lemmas", `{"query":"pow mod","limit":5}`), call("c2", "check_name", `{"name":"Nat.pow_mod"}`)}, Reasoning: "look up"},
+			{ToolCalls: []llm.ToolCall{call("c3", "check_proof", `{"tactics":"bad"}`)}},
+			{ToolCalls: []llm.ToolCall{call("c4", "check_name", `{"name":"x y; #eval 1"}`), call("c5", "check_proof", `{"tactics":"good"}`)}},
+		},
+	}
+	fk := &fakeLean{}
+	stages := []Stage{{Name: "tools", Spec: llm.ModelSpec{Model: "m", Effort: llm.EffortNone}, Sessions: 1, Attempts: 2, Tools: true}}
+	p := New(llm.NewAgent(tc, llm.Options{}), fk, Options{SkipSplit: true, NoExplain: true, NoAutomation: true, Stages: stages})
+	res, err := p.Run(context.Background(), "x", Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := res.Statements[0]
+	if s.Status != StatusProved || s.Proof != "good" {
+		t.Fatalf("stmt = %+v", s)
+	}
+	// both check_proof calls are attempts; the first carries Lean feedback
+	if len(s.Attempts) != 2 || s.Attempts[0].Verified || !strings.Contains(s.Attempts[0].Feedback, "linarith failed") ||
+		!s.Attempts[1].Verified || s.Attempts[0].ToolCalls != 3 || s.Attempts[1].ToolCalls != 2 {
+		t.Fatalf("attempts = %+v", s.Attempts)
+	}
+	// queries reached Lean as safe single-line commands; the injection was refused
+	if len(fk.queries) != 2 || fk.queries[0] != `#harness_search "pow mod" 5` || fk.queries[1] != "#check @Nat.pow_mod" {
+		t.Errorf("queries = %q", fk.queries)
+	}
+	// the model saw tool results, Lean feedback, the refusal, and its own reasoning
+	last := tc.seen[len(tc.seen)-1]
+	var all string
+	for _, m := range last {
+		all += m.Role + ":" + m.ReasoningContent + "|" + m.Content + "\n"
+	}
+	for _, want := range []string{"tool:|result of #harness_search", "assistant:look up|", "linarith failed"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("transcript missing %q:\n%s", want, all)
+		}
+	}
+	if !strings.Contains(fmt.Sprint(len(fk.proofs)), "2") {
+		t.Errorf("lean proof checks = %d", len(fk.proofs))
+	}
+}
+
+func TestToolStageBudget(t *testing.T) {
+	// model never stops calling tools: after the budget it is told to answer,
+	// keeps calling, and the round is recorded as no_answer
+	loop := llm.Response{ToolCalls: []llm.ToolCall{call("c", "check_name", `{"name":"Nat.add_comm"}`)}}
+	tc := &toolChat{
+		fakeLLM: fakeLLM{formal: []string{formal("stmt_1", ": 1 = 1")}},
+		turns:   []llm.Response{loop, loop, loop},
+	}
+	stages := []Stage{{Name: "tools", Sessions: 1, Attempts: 1, Tools: true, MaxToolCalls: 2}}
+	p := New(llm.NewAgent(tc, llm.Options{}), &fakeLean{}, Options{SkipSplit: true, NoExplain: true, NoAutomation: true, Stages: stages})
+	res, err := p.Run(context.Background(), "x", Hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := res.Statements[0]
+	if s.Status != StatusFailed || len(s.Attempts) != 1 || s.Attempts[0].ErrorKinds[0] != "no_answer" {
+		t.Fatalf("stmt = %+v", s)
+	}
+}
+
+func TestLeanString(t *testing.T) {
+	if got := leanString(`a "b" \ c`); got != `"a \"b\" \\ c"` {
+		t.Errorf("got %s", got)
 	}
 }

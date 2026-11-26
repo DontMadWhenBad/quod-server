@@ -209,3 +209,58 @@ func TestChatStreamEndsEarly(t *testing.T) {
 		t.Fatalf("err=%v resp=%+v calls=%d", err, resp, n.Load())
 	}
 }
+
+func TestChatToolCalls(t *testing.T) {
+	tools := []Tool{{Type: "function", Function: ToolFunction{Name: "check_name", Description: "d",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}`)}}}
+
+	// non-streaming: request carries tools and tool messages; response tool calls parsed
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Tools    []Tool    `json:"tools"`
+			Messages []Message `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if len(body.Tools) != 1 || body.Tools[0].Function.Name != "check_name" {
+			t.Errorf("tools = %+v", body.Tools)
+		}
+		if m := body.Messages[len(body.Messages)-1]; m.Role != "tool" || m.ToolCallID != "call_0" {
+			t.Errorf("last message = %+v", m)
+		}
+		if m := body.Messages[1]; m.ReasoningContent != "thought" || len(m.ToolCalls) != 1 {
+			t.Errorf("assistant history must keep reasoning and calls: %+v", m)
+		}
+		io.WriteString(w, `{"model":"deepseek-flash","choices":[{"message":{"content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"check_name","arguments":"{\"name\":\"Nat.pow_mod\"}"}}]},"finish_reason":"tool_calls"}],"usage":{}}`)
+	})
+	prev := Message{Role: "assistant", ReasoningContent: "thought", ToolCalls: []ToolCall{{ID: "call_0", Type: "function"}}}
+	resp, err := c.Chat(context.Background(), Request{Model: ModelFlash, Tools: tools,
+		Messages: []Message{User("x"), prev, ToolResult("call_0", "ok")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.FinishReason != "tool_calls" || len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Function.Arguments != `{"name":"Nat.pow_mod"}` {
+		t.Errorf("resp = %+v", resp)
+	}
+
+	// streaming: fragments are reassembled by index
+	c2 := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		for _, l := range []string{
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"check_","arguments":""}}]}}]}`,
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"name","arguments":"{\"name\":"}}]}}]}`,
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"search_lemmas","arguments":"{}"}}]}}]}`,
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}}]}}]}`,
+			`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			"data: [DONE]",
+		} {
+			io.WriteString(w, l+"\n\n")
+		}
+	})
+	resp, err = c2.Chat(context.Background(), Request{Model: ModelFlash, Tools: tools, Messages: []Message{User("x")}, OnProgress: func(Progress) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.ToolCalls) != 2 || resp.ToolCalls[0].ID != "call_a" || resp.ToolCalls[0].Function.Name != "check_name" ||
+		resp.ToolCalls[0].Function.Arguments != `{"name":"x"}` || resp.ToolCalls[1].Function.Name != "search_lemmas" {
+		t.Errorf("calls = %+v", resp.ToolCalls)
+	}
+}

@@ -3,6 +3,7 @@ package lean
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -54,11 +55,26 @@ func (e *ForbiddenError) Error() string {
 }
 
 // CheckForbidden scans Lean text (comments and string literals ignored).
-func CheckForbidden(text string) error {
+func CheckForbidden(text string) error { return CheckForbiddenAllow(text) }
+
+// CheckForbiddenAllow is CheckForbidden with some words permitted (e.g.
+// "sorry" when exploring a proof; such a proof can never be verified).
+func CheckForbiddenAllow(text string, allow ...string) error {
 	clean := stripCommentsAndStrings(text)
 	for i, line := range strings.Split(clean, "\n") {
-		if m := reForbiddenWord.FindStringSubmatch(line); m != nil {
-			return &ForbiddenError{Token: m[1], Line: i + 1}
+		// Restart each search right after the previous word (not after the
+		// boundary character the match consumed), so adjacent words like
+		// "sorry theorem" are each seen.
+		for at := 0; at < len(line); {
+			loc := reForbiddenWord.FindStringSubmatchIndex(line[at:])
+			if loc == nil {
+				break
+			}
+			word := line[at+loc[2] : at+loc[3]]
+			if !slices.Contains(allow, word) {
+				return &ForbiddenError{Token: word, Line: i + 1}
+			}
+			at += loc[3]
 		}
 		if m := reForbiddenHash.FindStringSubmatch(line); m != nil {
 			return &ForbiddenError{Token: "#" + m[1], Line: i + 1}

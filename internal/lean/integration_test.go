@@ -124,6 +124,23 @@ func TestIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("explore proof reports sorry goals, never verifies", func(t *testing.T) {
+		s := Statement{Name: "stmt_x", Signature: "(n : ℕ) : n ^ 2 + 0 = n * n"}
+		o, err := ExploreProof(ctx, r, nil, s, "rw [Nat.add_zero]\nsorry")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if o.Verdict.Verified || o.Result == nil || len(o.Result.Sorries) != 1 || !strings.Contains(o.Result.Sorries[0].Goal, "n ^ 2 = n * n") {
+			t.Fatalf("verdict=%+v sorries=%+v", o.Verdict, o.Result)
+		}
+		if o2, _ := CheckProof(ctx, r, nil, s, "sorry"); o2.Verdict.Errors[0].Kind != KindForbidden {
+			t.Errorf("CheckProof must still reject sorry up front: %+v", o2.Verdict)
+		}
+		if o3, _ := ExploreProof(ctx, r, nil, s, "sorry\ntheorem evil : False := sorry"); o3.Verdict.Errors[0].Kind != KindForbidden {
+			t.Errorf("explore must still reject commands: %+v", o3.Verdict)
+		}
+	})
+
 	// Must be last: a timeout kills the process.
 	t.Run("wall-clock timeout kills the process", func(t *testing.T) {
 		_, err := r.Exec(ctx, nil, "example : True := by\n  sleep 10000\n  trivial", ExecOptions{Timeout: time.Second})

@@ -224,3 +224,22 @@ func TestRenderFeedback(t *testing.T) {
 		t.Errorf("not truncated:\n%s", small)
 	}
 }
+
+func TestCheckForbiddenAllow(t *testing.T) {
+	if err := CheckForbiddenAllow("have h : x := by sorry\nexact sorry", "sorry"); err != nil {
+		t.Errorf("sorry should be allowed: %v", err)
+	}
+	for _, body := range []string{
+		"sorry theorem foo : False := sorry",
+		"sorry axiom a : False",
+		"exact sorry\n#eval 1",
+		"sorry sorry def x := 1",
+	} {
+		if err := CheckForbiddenAllow(body, "sorry"); err == nil {
+			t.Errorf("%q passed with only sorry allowed", body)
+		}
+	}
+	if fe, _ := CheckForbidden("sorry theorem").(*ForbiddenError); fe == nil || fe.Token != "sorry" {
+		t.Errorf("without allow list the first word is reported: %+v", fe)
+	}
+}

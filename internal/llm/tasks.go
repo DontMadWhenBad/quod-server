@@ -90,6 +90,10 @@ func (a *Agent) call(ctx context.Context, spec ModelSpec, asJSON bool, msgs ...M
 }
 
 func (a *Agent) callProgress(ctx context.Context, spec ModelSpec, asJSON bool, onProgress func(Progress), msgs ...Message) (*Response, error) {
+	return a.callTools(ctx, spec, asJSON, nil, onProgress, msgs...)
+}
+
+func (a *Agent) callTools(ctx context.Context, spec ModelSpec, asJSON bool, tools []Tool, onProgress func(Progress), msgs ...Message) (*Response, error) {
 	a.mu.Lock()
 	if a.opts.BudgetUSD > 0 && a.spent >= a.opts.BudgetUSD {
 		a.mu.Unlock()
@@ -98,7 +102,7 @@ func (a *Agent) callProgress(ctx context.Context, spec ModelSpec, asJSON bool, o
 	a.mu.Unlock()
 
 	resp, err := a.c.Chat(ctx, Request{Model: spec.Model, Effort: spec.Effort, MaxTokens: spec.MaxTokens,
-		JSON: asJSON, Messages: msgs, OnProgress: onProgress})
+		JSON: asJSON, Messages: msgs, Tools: tools, OnProgress: onProgress})
 	if resp != nil {
 		a.mu.Lock()
 		a.spent += resp.CostUSD
@@ -236,15 +240,16 @@ type ProveInput struct {
 // compiler feedback, propose a fix. Not safe for concurrent use; run
 // several sessions for parallel attempts.
 type ProofSession struct {
-	a       *Agent
-	spec    ModelSpec
-	intro   Message
-	rounds  []round // completed (proof, feedback) pairs
-	pending string  // last proposed reply awaiting feedback
-	dropped int     // rounds summarized away
+	a                *Agent
+	spec             ModelSpec
+	intro            Message
+	rounds           []round // completed (proof, feedback) pairs
+	pending          string  // last proposed reply awaiting feedback
+	pendingReasoning string  // its reasoning (sent back when tools are used)
+	dropped          int     // rounds summarized away
 }
 
-type round struct{ reply, feedback string }
+type round struct{ reply, reasoning, feedback string }
 
 // NewProofSession starts a proof conversation with the default prover
 // model (Models.Prove).
@@ -272,14 +277,7 @@ func (s *ProofSession) Next(ctx context.Context) (body string, resp *Response, e
 
 // NextProgress is Next with streaming progress reports (see Request.OnProgress).
 func (s *ProofSession) NextProgress(ctx context.Context, onProgress func(Progress)) (body string, resp *Response, err error) {
-	msgs := []Message{s.a.system(proveSystem), s.intro}
-	if s.dropped > 0 {
-		msgs = append(msgs, Assistant("(earlier attempts omitted)"),
-			User(fmt.Sprintf("%d earlier attempt(s) failed and are omitted. Continue.", s.dropped)))
-	}
-	for _, r := range s.rounds {
-		msgs = append(msgs, Assistant(r.reply), User(r.feedback))
-	}
+	msgs := s.history(proveSystem, false)
 	resp, err = s.a.callProgress(ctx, s.spec, false, onProgress, msgs...)
 	if err != nil {
 		return "", resp, err
@@ -291,14 +289,86 @@ func (s *ProofSession) NextProgress(ctx context.Context, onProgress func(Progres
 	return body, resp, nil
 }
 
+// history is the conversation so far: system prompt, task, earlier rounds.
+// withReasoning keeps each round's reasoning (required with tools).
+func (s *ProofSession) history(system string, withReasoning bool) []Message {
+	msgs := []Message{s.a.system(system), s.intro}
+	if s.dropped > 0 {
+		msgs = append(msgs, Assistant("(earlier attempts omitted)"),
+			User(fmt.Sprintf("%d earlier attempt(s) failed and are omitted. Continue.", s.dropped)))
+	}
+	for _, r := range s.rounds {
+		m := Assistant(r.reply)
+		if withReasoning {
+			m.ReasoningContent = r.reasoning
+		}
+		msgs = append(msgs, m, User(r.feedback))
+	}
+	return msgs
+}
+
+// ToolRunner executes the tools a proof session may use.
+type ToolRunner interface {
+	Tools() []Tool
+	// Run executes one call and returns the text shown to the model.
+	// stop=true ends the attempt (e.g. check_proof verified the proof).
+	Run(ctx context.Context, call ToolCall) (result string, stop bool)
+}
+
+// ErrNoAnswer means the model kept calling tools past its budget.
+var ErrNoAnswer = errors.New("llm: no final answer within the tool-call budget")
+
+// NextTools runs one attempt in which the model may call tools (at most
+// maxCalls in total) before replying with a proof. onTurn sees every LLM
+// response (cost, tokens). If a tool returns stop, NextTools returns
+// stopped=true. Otherwise body is the model's final proof.
+func (s *ProofSession) NextTools(ctx context.Context, runner ToolRunner, maxCalls int,
+	onProgress func(Progress), onTurn func(*Response)) (body string, stopped bool, err error) {
+	msgs := s.history(proveSystem+proveToolsAddendum, true)
+	tools := runner.Tools()
+	calls, warned := 0, false
+	for {
+		resp, err := s.a.callTools(ctx, s.spec, false, tools, onProgress, msgs...)
+		if resp != nil && onTurn != nil {
+			onTurn(resp)
+		}
+		if err != nil {
+			return "", false, err
+		}
+		if len(resp.ToolCalls) == 0 {
+			body = ExtractProofBody(resp.Content)
+			s.pending = "```lean\n" + body + "\n```"
+			s.pendingReasoning = resp.Reasoning
+			return body, false, nil
+		}
+		if warned {
+			return "", false, ErrNoAnswer
+		}
+		msgs = append(msgs, Message{Role: "assistant", Content: resp.Content,
+			ReasoningContent: resp.Reasoning, ToolCalls: resp.ToolCalls})
+		for _, c := range resp.ToolCalls {
+			calls++
+			result, stop := runner.Run(ctx, c)
+			if stop {
+				return "", true, nil
+			}
+			msgs = append(msgs, ToolResult(c.ID, result))
+		}
+		if calls >= maxCalls {
+			warned = true
+			msgs = append(msgs, User("Tool budget used up. Reply now with your final tactic proof in one lean code block, without calling tools."))
+		}
+	}
+}
+
 // Feedback records why the last proof failed; call Next for a fix.
 func (s *ProofSession) Feedback(feedback string) {
 	if s.pending == "" {
 		return
 	}
-	s.rounds = append(s.rounds, round{reply: s.pending, feedback: feedback +
+	s.rounds = append(s.rounds, round{reply: s.pending, reasoning: s.pendingReasoning, feedback: feedback +
 		"\n\nFix the proof. Reply with the complete corrected tactic script in one lean code block."})
-	s.pending = ""
+	s.pending, s.pendingReasoning = "", ""
 	if over := len(s.rounds) - s.a.opts.MaxFeedbackRounds; over > 0 {
 		s.rounds = s.rounds[over:]
 		s.dropped += over

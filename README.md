@@ -189,25 +189,41 @@ scripts/client.sh     example API client
 
 ## How it works
 
-- **Proof search.** First, automation: `omega`, `decide`, `norm_num`, `simp`,
-  `positivity`, `linarith`, `nlinarith`, `aesop` and `exact?` are tried
-  directly in Lean, with no LLM cost. If `exact?` succeeds, the term it found
-  becomes the proof. Then the model works up a ladder of stages, each racing
-  parallel sessions (propose → Lean check → feedback). A stage runs only if
-  the previous one failed, and repeated proofs are shared across sessions:
+- **Proof search.** First, automation: `omega`, `decide`, `norm_num`,
+  `simp`, `positivity`, `linarith`, `nlinarith`, `aesop` and `exact?` are
+  tried directly in Lean, with no LLM cost. If `exact?` succeeds, the term it
+  found becomes the proof. Then the model works up a ladder of stages, each
+  racing parallel sessions (propose → Lean check → feedback). A stage runs
+  only if the previous one failed, and failed proofs are shared across
+  sessions:
 
-  | stage | effort | sessions × attempts |
-  |---|---|---|
-  | `fast` | `none` | 4 × 3 |
-  | `think` | `low` | 2 × 3 |
-  | `deep` | `high` | 2 × 4 |
+  | stage | effort | tools | sessions × attempts |
+  |---|---|---|---|
+  | `fast` | `none` | – | 4 × 3 |
+  | `tools` | `none` | ✓ | 2 × 3 (≤ 16 tool calls each) |
+  | `deep-tools` | `high` | ✓ | 2 × 3 |
 
-  On easy goals, the model's thinking time goes mostly into second-guessing
-  Mathlib lemma names it cannot look up, which can mean 3–20k tokens and up
-  to a minute or more per attempt. Lean answers those questions in
-  milliseconds, so many cheap attempts with feedback usually win. Long
-  thinking streams `thinking… N tokens` progress events, and every attempt
-  records its model, effort and token counts.
+  Choose your own ladder with `-stages` (presets: `fast`, `tools`,
+  `tools-low`, `think`, `deep`, `deep-tools`).
+
+  **Tools** let the model use Lean while it works instead of guessing:
+  - `search_lemmas` finds theorems by name fragments (`#harness_search`);
+  - `check_name` shows a lemma's exact statement;
+  - `find_lemma` runs `exact?` on a sub-goal;
+  - `check_proof` compiles a candidate proof and returns errors and goals.
+    It accepts `sorry` placeholders and lists the open goal at each one, but
+    a proof with `sorry` is never verified. A passing `check_proof` ends the
+    search.
+
+  Arguments are validated before they become Lean code: single line,
+  bounded length, and the forbidden-syntax filter still applies.
+
+  Why: on easy goals, a thinking model spends most of its time (3–20k
+  tokens, a minute or more per attempt) second-guessing Mathlib lemma names
+  it cannot look up. With tools and no thinking, `3 ∣ n³ − n` went from
+  about 4 minutes to about 25 s. Every attempt records its stage, model,
+  effort, token counts and tool calls, and long generations stream
+  `thinking… N tokens` progress events.
 
 - **Incremental checking.** Each worker imports Mathlib once at startup
   (seconds). Every check after that runs against the loaded environment

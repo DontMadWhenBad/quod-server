@@ -70,6 +70,14 @@ func (fakeLean) CheckStatement(_ context.Context, base *lean.Snapshot, s lean.St
 	return &lean.StatementCheck{OK: true, Code: code, Snapshot: base.Extend(code)}, nil
 }
 
+func (f fakeLean) ExploreProof(ctx context.Context, base *lean.Snapshot, s lean.Statement, body string) (*lean.Outcome, error) {
+	return f.CheckProof(ctx, base, s, body)
+}
+
+func (fakeLean) Query(context.Context, *lean.Snapshot, string, time.Duration) (*lean.Result, error) {
+	return &lean.Result{}, nil
+}
+
 func (fakeLean) CheckProof(_ context.Context, base *lean.Snapshot, s lean.Statement, body string) (*lean.Outcome, error) {
 	a := lean.NewAttempt(s, body)
 	res := &lean.Result{Snapshot: base.Extend(a.Code)}
