@@ -15,6 +15,8 @@ statement(s) ─► split ─► formalize ─► Lean checks statement ─► b
 
 ## Setup
 
+Needs Go ≥ 1.26 (the pure-Go SQLite driver requires it).
+
 ```sh
 # 1. Lean toolchain, Mathlib (+ prebuilt cache), REPL, axiom checker, smoke tests
 scripts/bootstrap.sh
@@ -25,6 +27,7 @@ cp .env.example .env    # then set DEEPSEEK_API_KEY=...
 # 3. Build
 go build -o bin/prove ./cmd/prove
 go build -o bin/server ./cmd/server
+go build -o bin/quod-admin ./cmd/quod-admin
 ```
 
 `bootstrap.sh` is idempotent; rerun it after changing versions. Lean,
@@ -91,13 +94,32 @@ scripts/client.sh list | watch ID | result ID | status ID | cancel ID
 
 Pick the server with `-s URL` before the command (for example
 `scripts/client.sh -s http://127.0.0.1:18080 list`) or with `PROVER_URL`
-(default `http://127.0.0.1:8080`). Set `API_TOKEN` if the server needs one.
+(default `http://127.0.0.1:8080`). The access key is read from `QUOD_KEY`,
+`-k FILE`, or `~/.config/quod/key`.
 
 - **Limits:** `-max-running`, `-max-queued` (429 when full), `-job-budget`,
   `-max-job-budget`, `-daily-budget`, `-job-timeout`. Input is capped at 8 KB
   and 10 statements.
-- **Auth:** set `API_TOKEN` in `.env` to require `Authorization: Bearer <token>`.
-  There is none by default, so keep the server on localhost.
+- **Access keys** (`-auth keys`, the default): every `/v1` request needs
+  `Authorization: Bearer qk_...`, a key issued by the server's admin.
+  - Clients never handle the DeepSeek key; the service pays for LLM calls.
+  - Each key sees and controls only its own jobs; other jobs look like 404.
+  - A key can have its own daily budget.
+  - Keys live in a SQLite database (`-db`, default `quod.db`, mode 0600) as
+    SHA-256 hashes only. Every request is checked against the database, so
+    a created or revoked key takes effect on the next request, without a
+    restart. `quod-admin` and the server can use the database at the same
+    time.
+  - `-auth none` disables authentication, for local development only.
+  - Login (OAuth) can be added later as another authenticator; jobs and
+    budgets only see the caller's identity.
+
+  ```sh
+  go build -o bin/quod-admin ./cmd/quod-admin
+  bin/quod-admin keys create --name alice --daily-budget 2   # prints the key once
+  bin/quod-admin keys list
+  bin/quod-admin keys revoke alice
+  ```
 - **Storage:** jobs live in memory, are kept for 24 h, and are lost on restart.
 - **Shutdown:** on Ctrl-C or SIGTERM the server stops accepting jobs, waits
   `-grace` for running ones, cancels the rest, then exits.
@@ -138,6 +160,7 @@ DEEPSEEK_LIVE=1 go test -v -run TestLive ./internal/llm/        # real API (< $0
 ```
 cmd/prove/            CLI driver for the pipeline
 cmd/server/           HTTP API server
+cmd/quod-admin/       access key management
 internal/
   lean/               Lean source
     repl.go             one REPL process: JSON protocol, timeouts, env cache
@@ -155,7 +178,8 @@ internal/
     extract.go          code/signature extraction from replies
   pipeline/           orchestration: statement chaining, repair loop, events, confirm hook
   jobs/               job manager: queue, limits, budgets, event log, confirm hand-off
-  server/             HTTP handlers, SSE, auth
+  server/             HTTP handlers, SSE, auth middleware
+  auth/               principals, access key store (SQLite)
   dotenv/             .env loader
 lean_env/             Lake project: Mathlib + REPL + Harness
   Harness/AxiomCheck.lean   #harness_axioms command

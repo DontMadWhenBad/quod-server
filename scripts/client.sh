@@ -9,16 +9,18 @@
 #   scripts/client.sh -s http://host:8080 prove "..."      # pick the server
 #
 # Global options (before the command):
-#   -s, --server URL  server base URL (overrides PROVER_URL)
+#   -s, --server URL      server base URL (overrides PROVER_URL)
+#   -k, --key-file PATH   access key file (default ~/.config/quod/key)
 #
 # Environment:
 #   PROVER_URL  server base URL (default http://127.0.0.1:8080)
-#   API_TOKEN   bearer token, if the server requires one
+#   QUOD_KEY    access key (qk_...); overrides the key file
 set -euo pipefail
 
 die() { printf 'client: %s\n' "$*" >&2; exit 1; }
 
 URL="${PROVER_URL:-http://127.0.0.1:8080}"
+KEY_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/quod/key"
 while (( $# )); do
   case $1 in
     -s|--server)
@@ -26,6 +28,11 @@ while (( $# )); do
       URL=$2; shift 2 ;;
     --server=*)
       URL=${1#--server=}; shift ;;
+    -k|--key-file)
+      [[ $# -ge 2 && -n $2 ]] || die "$1 needs a path"
+      KEY_FILE=$2; [[ -r $KEY_FILE ]] || die "cannot read key file $KEY_FILE"; shift 2 ;;
+    --key-file=*)
+      KEY_FILE=${1#--key-file=}; [[ -r $KEY_FILE ]] || die "cannot read key file $KEY_FILE"; shift ;;
     *) break ;;
   esac
 done
@@ -40,8 +47,19 @@ else
   B='' DIM='' RED='' GRN='' YEL='' BLU='' RST=''
 fi
 
+# Access key: QUOD_KEY, else the key file. Passed to curl through a private
+# header file so it never appears on a command line (visible in `ps`).
+KEY="${QUOD_KEY:-}"
+if [[ -z $KEY && -r $KEY_FILE ]]; then
+  KEY=$(tr -d '[:space:]' < "$KEY_FILE")
+fi
 auth=()
-[[ -n "${API_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer $API_TOKEN")
+if [[ -n $KEY ]]; then
+  HDR=$(umask 077; mktemp)
+  trap 'rm -f "$HDR"' EXIT
+  printf 'Authorization: Bearer %s\n' "$KEY" > "$HDR"
+  auth=(-H "@$HDR")
+fi
 
 # api METHOD PATH [JSON_BODY] -> prints body; fails with the server's error message.
 api() {

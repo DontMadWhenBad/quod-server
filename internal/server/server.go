@@ -11,7 +11,6 @@ package server
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"mathprover/internal/auth"
 	"mathprover/internal/jobs"
 	"mathprover/internal/pipeline"
 )
@@ -30,7 +30,10 @@ import (
 // Server serves the API. Set Manager once Lean is ready; until then job
 // endpoints return 503.
 type Server struct {
-	Token     string        // if set, required as "Authorization: Bearer <token>"
+	// Auth identifies callers of /v1 endpoints; nil disables authentication
+	// (every caller is auth.Anonymous; development only). Jobs are visible
+	// only to the principal that created them.
+	Auth      auth.Authenticator
 	Log       *slog.Logger  // default slog.Default()
 	Heartbeat time.Duration // SSE keep-alive interval; default 15s
 
@@ -76,6 +79,28 @@ func (s *Server) withManager(h managerHandler) http.HandlerFunc {
 	}
 }
 
+// principal is the authenticated caller (set by the auth middleware).
+func principal(r *http.Request) *auth.Principal {
+	if p := auth.FromContext(r.Context()); p != nil {
+		return p
+	}
+	return auth.Anonymous
+}
+
+// ownedJob loads the job in the path if the caller owns it. Other callers'
+// jobs are reported as not found, so job ids leak nothing.
+func ownedJob(w http.ResponseWriter, r *http.Request, m *jobs.Manager) (*jobs.Job, bool) {
+	j, err := m.Get(r.PathValue("id"))
+	if err == nil && j.Owner.ID != principal(r).ID {
+		err = jobs.ErrNotFound
+	}
+	if err != nil {
+		writeManagerError(w, err)
+		return nil, false
+	}
+	return j, true
+}
+
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -99,7 +124,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request, m *jobs.Manag
 	if !readJSON(w, r, int64(m.Config().MaxInputBytes)+4096, &req) {
 		return
 	}
-	j, err := m.Submit(req.Input, req.Options)
+	j, err := m.Submit(req.Input, req.Options, principal(r))
 	if err != nil {
 		writeManagerError(w, err)
 		return
@@ -125,7 +150,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, m *jobs.Manage
 		limit = min(v, 500)
 	}
 	out := []jobSummary{}
-	for _, j := range m.List() {
+	for _, j := range m.List(principal(r).ID) {
 		if len(out) == limit {
 			break
 		}
@@ -143,9 +168,8 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, m *jobs.Manage
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request, m *jobs.Manager) {
-	j, err := m.Get(r.PathValue("id"))
-	if err != nil {
-		writeManagerError(w, err)
+	j, ok := ownedJob(w, r, m)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, j.View(r.URL.Query().Get("detail") == "full"))
@@ -166,22 +190,26 @@ func (s *Server) confirm(w http.ResponseWriter, r *http.Request, m *jobs.Manager
 		writeError(w, http.StatusBadRequest, "invalid_request", "stmt (1-based statement index) is required")
 		return
 	}
-	id := r.PathValue("id")
-	if err := m.Confirm(id, req.Stmt, pipeline.Decision{Accept: req.Accept, Correction: req.Correction}); err != nil {
+	j, ok := ownedJob(w, r, m)
+	if !ok {
+		return
+	}
+	if err := m.Confirm(j.ID, req.Stmt, pipeline.Decision{Accept: req.Accept, Correction: req.Correction}); err != nil {
 		writeManagerError(w, err)
 		return
 	}
-	j, _ := m.Get(id)
 	writeJSON(w, http.StatusOK, j.View(false))
 }
 
 func (s *Server) cancel(w http.ResponseWriter, r *http.Request, m *jobs.Manager) {
-	id := r.PathValue("id")
-	if err := m.Cancel(id); err != nil {
+	j, ok := ownedJob(w, r, m)
+	if !ok {
+		return
+	}
+	if err := m.Cancel(j.ID); err != nil {
 		writeManagerError(w, err)
 		return
 	}
-	j, _ := m.Get(id)
 	writeJSON(w, http.StatusAccepted, j.View(false))
 }
 
@@ -189,9 +217,8 @@ func (s *Server) cancel(w http.ResponseWriter, r *http.Request, m *jobs.Manager)
 // Last-Event-ID header (sent automatically by EventSource) or ?after=N.
 // The stream ends after the job's final event.
 func (s *Server) events(w http.ResponseWriter, r *http.Request, m *jobs.Manager) {
-	j, err := m.Get(r.PathValue("id"))
-	if err != nil {
-		writeManagerError(w, err)
+	j, ok := ownedJob(w, r, m)
+	if !ok {
 		return
 	}
 	after := 0
@@ -265,22 +292,26 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request, m *jobs.Manager)
 // ---------------------------------------------------------------- middleware
 
 func (s *Server) auth(next http.Handler) http.Handler {
-	if s.Token == "" {
-		return next
-	}
-	want := []byte("Bearer " + s.Token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		got := []byte(r.Header.Get("Authorization"))
-		if subtle.ConstantTimeCompare(got, want) != 1 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="mathprover"`)
-			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
-			return
+		p := auth.Anonymous
+		if s.Auth != nil {
+			var err error
+			p, err = s.Auth.Authenticate(r)
+			if err != nil {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="quod"`)
+				msg := "missing access key (Authorization: Bearer qk_...)"
+				if errors.Is(err, auth.ErrInvalid) {
+					msg = "invalid or revoked access key"
+				}
+				writeError(w, http.StatusUnauthorized, "unauthorized", msg)
+				return
+			}
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), p)))
 	})
 }
 

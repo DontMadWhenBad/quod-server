@@ -2,3 +2,4 @@
 lean_env/.lake/
 /bin/
 *.txt
+quod.db*

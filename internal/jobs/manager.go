@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"mathprover/internal/auth"
 	"mathprover/internal/llm"
 	"mathprover/internal/pipeline"
 )
@@ -102,6 +103,8 @@ type Manager struct {
 	closed   bool
 	day      string
 	daySpent float64
+	// ownerSpent is today's spending per principal ID.
+	ownerSpent map[string]float64
 }
 
 // NewManager starts a manager (and its janitor goroutine).
@@ -114,6 +117,8 @@ func NewManager(deps Deps, cfg Config) *Manager {
 		sem:  make(chan struct{}, cfg.MaxRunning),
 		stop: make(chan struct{}),
 		jobs: map[string]*Job{},
+
+		ownerSpent: map[string]float64{},
 	}
 	go m.janitor()
 	return m
@@ -122,8 +127,11 @@ func NewManager(deps Deps, cfg Config) *Manager {
 // Config returns the effective configuration.
 func (m *Manager) Config() Config { return m.cfg }
 
-// Submit validates and enqueues a job.
-func (m *Manager) Submit(input string, opts Options) (*Job, error) {
+// Submit validates and enqueues a job owned by owner (nil = anonymous).
+func (m *Manager) Submit(input string, opts Options, owner *auth.Principal) (*Job, error) {
+	if owner == nil {
+		owner = auth.Anonymous
+	}
 	input = strings.TrimSpace(input)
 	switch {
 	case input == "":
@@ -149,18 +157,27 @@ func (m *Manager) Submit(input string, opts Options) (*Job, error) {
 	if m.active >= m.cfg.MaxRunning+m.cfg.MaxQueued {
 		return nil, ErrQueueFull
 	}
+	// Approximate caps: concurrent jobs may together overshoot by about
+	// one job's budget.
 	budget := opts.BudgetUSD
+	m.rollDayLocked()
 	if m.cfg.DailyBudgetUSD > 0 {
-		m.rollDayLocked()
 		left := m.cfg.DailyBudgetUSD - m.daySpent
 		if left <= 0 {
 			return nil, ErrDailyBudget
 		}
-		// Approximate: concurrent jobs may together overshoot by one job's budget.
+		budget = min(budget, left)
+	}
+	if owner.DailyBudgetUSD > 0 {
+		left := owner.DailyBudgetUSD - m.ownerSpent[owner.ID]
+		if left <= 0 {
+			return nil, fmt.Errorf("%w for %s", ErrDailyBudget, owner.Name)
+		}
 		budget = min(budget, left)
 	}
 
 	j := newJob(newID(), input, opts, budget)
+	j.Owner = *owner
 	ctx, cancel := context.WithTimeout(m.base, m.cfg.JobTimeout)
 	j.cancel = cancel
 	m.jobs[j.ID] = j
@@ -222,6 +239,7 @@ func (m *Manager) run(ctx context.Context, cancel context.CancelFunc, j *Job) {
 	m.mu.Lock()
 	m.rollDayLocked()
 	m.daySpent += usd
+	m.ownerSpent[j.Owner.ID] += usd
 	m.mu.Unlock()
 
 	j.finish(res, err, m.base.Err() != nil)
@@ -238,12 +256,14 @@ func (m *Manager) Get(id string) (*Job, error) {
 	return j, nil
 }
 
-// List returns jobs, newest first.
-func (m *Manager) List() []*Job {
+// List returns ownerID's jobs ("" = all), newest first.
+func (m *Manager) List(ownerID string) []*Job {
 	m.mu.Lock()
 	out := make([]*Job, 0, len(m.jobs))
 	for _, j := range m.jobs {
-		out = append(out, j)
+		if ownerID == "" || j.Owner.ID == ownerID {
+			out = append(out, j)
+		}
 	}
 	m.mu.Unlock()
 	sort.Slice(out, func(a, b int) bool { return out[a].Created.After(out[b].Created) })
@@ -309,7 +329,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 
 func (m *Manager) rollDayLocked() {
 	if d := time.Now().UTC().Format("2006-01-02"); d != m.day {
-		m.day, m.daySpent = d, 0
+		m.day, m.daySpent, m.ownerSpent = d, 0, map[string]float64{}
 	}
 }
 

@@ -37,7 +37,7 @@ func TestDailyBudget(t *testing.T) {
 		Config{DailyBudgetUSD: 1.0, MaxBudgetUSD: 5, DefaultBudgetUSD: 5})
 	defer m.Shutdown(context.Background())
 
-	j1, err := m.Submit("x", Options{})
+	j1, err := m.Submit("x", Options{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestDailyBudget(t *testing.T) {
 	if s := m.Stats(); s.DailySpentUSD < 1.0 {
 		t.Fatalf("daily spent = %g", s.DailySpentUSD)
 	}
-	if _, err := m.Submit("y", Options{}); !errors.Is(err, ErrDailyBudget) {
+	if _, err := m.Submit("y", Options{}, nil); !errors.Is(err, ErrDailyBudget) {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -58,7 +58,7 @@ func TestPrune(t *testing.T) {
 	defer m.Shutdown(context.Background())
 	var js []*Job
 	for range 4 {
-		j, err := m.Submit("x", Options{})
+		j, err := m.Submit("x", Options{}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -67,14 +67,14 @@ func TestPrune(t *testing.T) {
 		time.Sleep(2 * time.Millisecond) // distinct finish times
 	}
 	m.prune(time.Now())
-	if n := len(m.List()); n != 2 {
+	if n := len(m.List("")); n != 2 {
 		t.Fatalf("kept %d jobs, want 2", n)
 	}
 	if _, err := m.Get(js[0].ID); !errors.Is(err, ErrNotFound) {
 		t.Error("oldest job should be pruned first")
 	}
 	m.prune(time.Now().Add(2 * time.Hour))
-	if n := len(m.List()); n != 0 {
+	if n := len(m.List("")); n != 0 {
 		t.Errorf("expired jobs kept: %d", n)
 	}
 }
@@ -84,7 +84,7 @@ func TestShutdownRejectsNewJobs(t *testing.T) {
 	if err := m.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Submit("x", Options{}); !errors.Is(err, ErrClosed) {
+	if _, err := m.Submit("x", Options{}, nil); !errors.Is(err, ErrClosed) {
 		t.Fatalf("err = %v", err)
 	}
 }

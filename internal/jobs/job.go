@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"mathprover/internal/auth"
 	"mathprover/internal/pipeline"
 )
 
@@ -82,6 +83,7 @@ type Job struct {
 	Options   Options
 	BudgetUSD float64 // effective budget after clamping
 	Created   time.Time
+	Owner     auth.Principal // who submitted it; only they can see or control it
 
 	mu        sync.Mutex
 	state     State
@@ -257,6 +259,7 @@ func (j *Job) finish(res *pipeline.Result, err error, shuttingDown bool) {
 // View is the JSON representation of a job.
 type View struct {
 	ID         string                      `json:"id"`
+	Owner      string                      `json:"owner"` // principal name
 	State      State                       `json:"state"`
 	Input      string                      `json:"input"`
 	Options    Options                     `json:"options"`
@@ -278,7 +281,7 @@ func (j *Job) View(full bool) View {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	v := View{
-		ID: j.ID, State: j.state, Input: j.Input, Options: j.Options, BudgetUSD: j.BudgetUSD,
+		ID: j.ID, Owner: j.Owner.Name, State: j.state, Input: j.Input, Options: j.Options, BudgetUSD: j.BudgetUSD,
 		Created: j.Created, Error: j.errMsg, Events: len(j.events),
 	}
 	if !j.started.IsZero() {

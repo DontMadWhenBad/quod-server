@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"mathprover/internal/auth"
 	"mathprover/internal/dotenv"
 	"mathprover/internal/jobs"
 	"mathprover/internal/lean"
@@ -31,7 +32,9 @@ func main() {
 	var (
 		addr        = flag.String("addr", "127.0.0.1:8080", "listen address")
 		leanDir     = flag.String("lean-dir", "lean_env", "Lake project with Mathlib")
-		envFile     = flag.String("env", ".env", "dotenv file (DEEPSEEK_API_KEY, API_TOKEN)")
+		envFile     = flag.String("env", ".env", "dotenv file (DEEPSEEK_API_KEY)")
+		authMode    = flag.String("auth", "keys", "client authentication: keys (server-issued access keys) | none (development only)")
+		dbPath      = flag.String("db", "quod.db", "SQLite database with access keys (manage with: quod-admin keys ...)")
 		workers     = flag.Int("workers", 2, "warm Lean REPL workers; each job leases one and it is discarded afterwards (~0.5-1GB private RAM each + ~5GB shared)")
 		sandboxKind = flag.String("sandbox", "bwrap", "Lean process isolation: bwrap | none (none only for trusted input)")
 		sandboxMem  = flag.String("sandbox-mem", "10G", "memory limit per Lean worker (systemd scope); empty = none")
@@ -55,9 +58,27 @@ func main() {
 	if err := dotenv.Load(*envFile); err != nil {
 		fatal(log, "loading env file", err)
 	}
-	token := strings.TrimSpace(os.Getenv("API_TOKEN"))
-	if token == "" && !isLoopback(*addr) {
-		log.Warn("listening on a non-loopback address without API_TOKEN: anyone who can reach it can spend your LLM budget")
+	var authn auth.Authenticator
+	switch *authMode {
+	case "keys":
+		store, err := auth.OpenKeyStore(*dbPath)
+		if err != nil {
+			fatal(log, "access keys", err)
+		}
+		defer store.Close()
+		if n, err := store.ActiveKeys(); err != nil {
+			fatal(log, "access keys", err)
+		} else if n == 0 {
+			log.Warn("no access keys yet: every API request will be rejected; create one with `quod-admin keys create --name NAME`", "db", *dbPath)
+		}
+		authn = store
+	case "none":
+		if !isLoopback(*addr) {
+			log.Warn("-auth none on a non-loopback address: anyone who can reach it can spend your LLM budget")
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "unknown -auth %q (want keys or none)\n", *authMode)
+		os.Exit(2)
 	}
 
 	client, err := llm.NewClientFromEnv()
@@ -73,7 +94,7 @@ func main() {
 
 	// Listen first so /healthz answers while Lean loads; job endpoints
 	// return 503 until the pool is ready.
-	srv := &server.Server{Token: token, Log: log}
+	srv := &server.Server{Auth: authn, Log: log}
 	httpSrv := &http.Server{
 		Addr:              *addr,
 		Handler:           srv.Handler(),
@@ -89,7 +110,7 @@ func main() {
 	if err != nil {
 		fatal(log, "listen", err)
 	}
-	log.Info("listening", "addr", ln.Addr().String(), "auth", token != "")
+	log.Info("listening", "addr", ln.Addr().String(), "auth", *authMode)
 	go func() {
 		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fatal(log, "http server", err)

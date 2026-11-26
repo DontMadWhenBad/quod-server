@@ -8,12 +8,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"mathprover/internal/auth"
 	"mathprover/internal/jobs"
 	"mathprover/internal/lean"
 	"mathprover/internal/llm"
@@ -87,11 +89,11 @@ type harness struct {
 	tok string
 }
 
-func newHarness(t *testing.T, cfg jobs.Config, token string) *harness {
+func newHarness(t *testing.T, cfg jobs.Config, a auth.Authenticator) *harness {
 	t.Helper()
 	f := &fakeLLM{}
 	mgr := jobs.NewManager(jobs.Deps{Chatter: f, Checkers: pipeline.StaticSource{C: fakeLean{}}, Models: llm.DefaultModels()}, cfg)
-	srv := &Server{Token: token, Log: discardLogger(), Heartbeat: 50 * time.Millisecond}
+	srv := &Server{Auth: a, Log: discardLogger(), Heartbeat: 50 * time.Millisecond}
 	srv.SetManager(mgr)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() {
@@ -100,7 +102,7 @@ func newHarness(t *testing.T, cfg jobs.Config, token string) *harness {
 		_ = mgr.Shutdown(ctx)
 		ts.Close()
 	})
-	return &harness{t: t, ts: ts, mgr: mgr, llm: f, tok: token}
+	return &harness{t: t, ts: ts, mgr: mgr, llm: f}
 }
 
 func (h *harness) do(method, path, body string, out any) int {
@@ -204,7 +206,7 @@ func (h *harness) readSSE(path, lastID string) []sseEvent {
 }
 
 func TestJobLifecycleAndSSE(t *testing.T) {
-	h := newHarness(t, jobs.Config{}, "")
+	h := newHarness(t, jobs.Config{}, nil)
 	v := h.submit(`{"input": "a; b"}`)
 	if v.ID == "" || v.Options.Attempts != 0 || v.BudgetUSD != 0.25 {
 		t.Fatalf("view = %+v", v)
@@ -253,7 +255,7 @@ func TestJobLifecycleAndSSE(t *testing.T) {
 }
 
 func TestLiveStreamWhileRunning(t *testing.T) {
-	h := newHarness(t, jobs.Config{}, "")
+	h := newHarness(t, jobs.Config{}, nil)
 	h.llm.gate = make(chan struct{})
 	v := h.submit(`{"input": "x", "options": {"no_explain": true}}`)
 	got := make(chan []sseEvent, 1)
@@ -267,7 +269,7 @@ func TestLiveStreamWhileRunning(t *testing.T) {
 }
 
 func TestConfirmFlow(t *testing.T) {
-	h := newHarness(t, jobs.Config{}, "")
+	h := newHarness(t, jobs.Config{}, nil)
 	v := h.submit(`{"input": "x", "options": {"confirm": true, "no_split": true}}`)
 	aw := h.waitState(v.ID, jobs.StateAwaiting)
 	if aw.Pending == nil || aw.Pending.Signature != ": 1 = 1" || aw.Pending.BackTranslation != "one equals one" {
@@ -289,7 +291,7 @@ func TestConfirmFlow(t *testing.T) {
 }
 
 func TestCancelQueuedAndRunning(t *testing.T) {
-	h := newHarness(t, jobs.Config{MaxRunning: 1, MaxQueued: 1}, "")
+	h := newHarness(t, jobs.Config{MaxRunning: 1, MaxQueued: 1}, nil)
 	h.llm.gate = make(chan struct{}) // proofs block forever
 	running := h.submit(`{"input": "x"}`)
 	h.waitState(running.ID, jobs.StateRunning)
@@ -312,7 +314,7 @@ func TestCancelQueuedAndRunning(t *testing.T) {
 }
 
 func TestValidationAndErrors(t *testing.T) {
-	h := newHarness(t, jobs.Config{MaxInputBytes: 10}, "")
+	h := newHarness(t, jobs.Config{MaxInputBytes: 10}, nil)
 	cases := []struct {
 		body string
 		code int
@@ -338,19 +340,112 @@ func TestValidationAndErrors(t *testing.T) {
 	}
 }
 
-func TestAuth(t *testing.T) {
-	h := newHarness(t, jobs.Config{}, "s3cret")
-	h.tok = "wrong"
-	if code := h.do("GET", "/v1/jobs", "", nil); code != 401 {
-		t.Errorf("wrong token: %d", code)
+func TestAccessKeys(t *testing.T) {
+	store, err := auth.OpenKeyStore(filepath.Join(t.TempDir(), "quod.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	alice, _, err := store.Create("alice", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, _, err := store.Create("bob", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, jobs.Config{}, store)
+
+	var e struct {
+		Error struct{ Code, Message string } `json:"error"`
+	}
+	if code := h.do("GET", "/v1/jobs", "", &e); code != 401 || !strings.Contains(e.Error.Message, "missing access key") {
+		t.Errorf("no key: %d %+v", code, e)
+	}
+	h.tok = "qk_notarealkey"
+	if code := h.do("GET", "/v1/jobs", "", &e); code != 401 || !strings.Contains(e.Error.Message, "invalid") {
+		t.Errorf("bad key: %d %+v", code, e)
 	}
 	h.tok = ""
 	if code := h.do("GET", "/healthz", "", nil); code != 200 {
-		t.Errorf("healthz should not need auth: %d", code)
+		t.Errorf("healthz should not need a key: %d", code)
 	}
-	h.tok = "s3cret"
-	if code := h.do("GET", "/v1/jobs", "", nil); code != 200 {
-		t.Errorf("right token: %d", code)
+
+	// alice's job is hers alone
+	h.tok = alice
+	v := h.submit(`{"input": "x", "options": {"no_explain": true}}`)
+	if v.Owner != "alice" {
+		t.Errorf("owner = %q", v.Owner)
+	}
+	h.waitState(v.ID, jobs.StateDone)
+	h.tok = bob
+	for _, c := range []struct{ method, path string }{
+		{"GET", "/v1/jobs/" + v.ID},
+		{"GET", "/v1/jobs/" + v.ID + "/events"},
+		{"POST", "/v1/jobs/" + v.ID + "/cancel"},
+		{"POST", "/v1/jobs/" + v.ID + "/confirm"},
+	} {
+		body := ""
+		if strings.HasSuffix(c.path, "/confirm") {
+			body = `{"stmt": 1, "accept": true}`
+		}
+		if code := h.do(c.method, c.path, body, nil); code != 404 {
+			t.Errorf("bob %s %s: %d, want 404", c.method, c.path, code)
+		}
+	}
+	var list struct {
+		Jobs []struct{ ID string } `json:"jobs"`
+	}
+	h.do("GET", "/v1/jobs", "", &list)
+	if len(list.Jobs) != 0 {
+		t.Errorf("bob sees alice's jobs: %+v", list)
+	}
+	h.tok = alice
+	h.do("GET", "/v1/jobs", "", &list)
+	if len(list.Jobs) != 1 {
+		t.Errorf("alice's list: %+v", list)
+	}
+
+	// revoking takes effect on the next request, without a restart
+	if _, err := store.Revoke("alice"); err != nil {
+		t.Fatal(err)
+	}
+	if code := h.do("GET", "/v1/jobs", "", nil); code != 401 {
+		t.Fatalf("revoked key: %d", code)
+	}
+}
+
+func TestPerKeyDailyBudget(t *testing.T) {
+	store, err := auth.OpenKeyStore(filepath.Join(t.TempDir(), "quod.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	k, _, err := store.Create("small", 0.015) // one job costs >= $0.01
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, jobs.Config{}, store)
+	h.tok = k
+	v := h.submit(`{"input": "x", "options": {"no_explain": true, "parallel": 1}}`)
+	if v.BudgetUSD > 0.015 {
+		t.Errorf("job budget %g exceeds the key's daily budget", v.BudgetUSD)
+	}
+	h.waitState(v.ID, jobs.StateDone)
+	h.do("POST", "/v1/jobs", `{"input": "y"}`, nil) // may still fit
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var e struct {
+			Error struct{ Code string } `json:"error"`
+		}
+		code := h.do("POST", "/v1/jobs", `{"input": "z", "options": {"no_explain": true}}`, &e)
+		if code == 429 && e.Error.Code == "daily_budget_exhausted" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("per-key budget never enforced (last status %d)", code)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
