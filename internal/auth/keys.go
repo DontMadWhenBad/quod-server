@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -240,4 +241,27 @@ func scanKey(sc scanner) (Key, error) {
 		k.Revoked = &t
 	}
 	return k, nil
+}
+
+// Backup writes a consistent copy of the database to dst (which must not
+// exist) while it may be in use, readable by the owner only.
+func (s *KeyStore) Backup(dst string) error {
+	if _, err := os.Stat(dst); err == nil {
+		return fmt.Errorf("auth: %s already exists", dst)
+	}
+	// VACUUM INTO a private temp dir next to dst, then move into place, so
+	// the copy is never readable by others even briefly.
+	dir, err := os.MkdirTemp(filepath.Dir(dst), ".quod-backup-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	tmp := filepath.Join(dir, "backup.db")
+	if _, err := s.db.Exec(`VACUUM INTO ?`, tmp); err != nil {
+		return fmt.Errorf("auth: backup: %w", err)
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
 }

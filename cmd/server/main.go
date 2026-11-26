@@ -35,6 +35,11 @@ func main() {
 		envFile     = flag.String("env", ".env", "dotenv file (DEEPSEEK_API_KEY)")
 		authMode    = flag.String("auth", "keys", "client authentication: keys (server-issued access keys) | none (development only)")
 		dbPath      = flag.String("db", "quod.db", "SQLite database with access keys (manage with: quod-admin keys ...)")
+		proxies     = flag.String("trusted-proxies", "", "comma-separated CIDRs/addresses of reverse proxies whose CF-Connecting-IP / X-Forwarded-For are trusted (e.g. 127.0.0.1,::1 for a local cloudflared)")
+		rateUnauth  = flag.Float64("rate-unauth", 20, "requests per minute per client IP without a valid key")
+		rateKey     = flag.Float64("rate-key", 120, "requests per minute per access key")
+		maxJobsKey  = flag.Int("max-jobs-per-key", 2, "queued + running jobs per access key")
+		maxStreams  = flag.Int("max-streams-per-key", 8, "open event streams per access key")
 		workers     = flag.Int("workers", 2, "warm Lean REPL workers; each job leases one and it is discarded afterwards (~0.5-1GB private RAM each + ~5GB shared)")
 		sandboxKind = flag.String("sandbox", "bwrap", "Lean process isolation: bwrap | none (none only for trusted input)")
 		sandboxMem  = flag.String("sandbox-mem", "10G", "memory limit per Lean worker (systemd scope); empty = none")
@@ -59,6 +64,15 @@ func main() {
 	if err := dotenv.Load(*envFile); err != nil {
 		fatal(log, "loading env file", err)
 	}
+	if err := checkAuthMode(*authMode, *addr); err != nil {
+		fmt.Fprintln(os.Stderr, "server:", err)
+		os.Exit(2)
+	}
+	trust, err := server.ParseTrustedProxies(*proxies)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "server:", err)
+		os.Exit(2)
+	}
 	var authn auth.Authenticator
 	switch *authMode {
 	case "keys":
@@ -74,12 +88,7 @@ func main() {
 		}
 		authn = store
 	case "none":
-		if !isLoopback(*addr) {
-			log.Warn("-auth none on a non-loopback address: anyone who can reach it can spend your LLM budget")
-		}
-	default:
-		fmt.Fprintf(os.Stderr, "unknown -auth %q (want keys or none)\n", *authMode)
-		os.Exit(2)
+		log.Warn("authentication disabled (-auth none): development only, localhost only")
 	}
 
 	client, err := llm.NewClientFromEnv()
@@ -99,11 +108,13 @@ func main() {
 
 	// Listen first so /healthz answers while Lean loads; job endpoints
 	// return 503 until the pool is ready.
-	srv := &server.Server{Auth: authn, Log: log}
+	srv := &server.Server{Auth: authn, Log: log, Proxies: trust,
+		Limits: server.Limits{UnauthPerMin: *rateUnauth, KeyPerMin: *rateKey, MaxStreamsPerKey: *maxStreams}}
 	httpSrv := &http.Server{
 		Addr:              *addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 		IdleTimeout:       2 * time.Minute,
 		// No WriteTimeout: SSE streams are long-lived; handlers set
 		// per-write deadlines instead.
@@ -162,6 +173,7 @@ func main() {
 	}, jobs.Config{
 		MaxRunning:       *maxRunning,
 		MaxQueued:        *maxQueued,
+		MaxActivePerKey:  *maxJobsKey,
 		DefaultBudgetUSD: *jobBudget,
 		MaxBudgetUSD:     *maxBudget,
 		DailyBudgetUSD:   *dailyBudget,
@@ -170,6 +182,21 @@ func main() {
 		NoAutomation:     *noAuto,
 	})
 	srv.SetManager(mgr)
+
+	// Server-wide numbers are not exposed over the API; log them instead.
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				st := mgr.Stats()
+				log.Info("stats", "active_jobs", st.Active, "jobs_kept", st.Jobs, "daily_spent_usd", fmt.Sprintf("%.4f", st.DailySpentUSD))
+			case <-sigCtx.Done():
+				return
+			}
+		}
+	}()
 
 	<-sigCtx.Done()
 	stop() // a second Ctrl-C kills immediately
@@ -208,6 +235,22 @@ func leanVersion(dir string) string {
 	v := strings.TrimSpace(string(b))
 	v = v[strings.LastIndex(v, ":")+1:]
 	return fmt.Sprintf("Lean %s, Mathlib %s", v, v)
+}
+
+// checkAuthMode refuses to serve without authentication anywhere but on a
+// loopback address.
+func checkAuthMode(mode, addr string) error {
+	switch mode {
+	case "keys":
+		return nil
+	case "none":
+		if !isLoopback(addr) {
+			return fmt.Errorf("-auth none is only allowed on a loopback address (got %q); use -auth keys", addr)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown -auth %q (want keys or none)", mode)
+	}
 }
 
 func isLoopback(addr string) bool {

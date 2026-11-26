@@ -122,3 +122,32 @@ func TestNewerSchemaRejected(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestBackup(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, filepath.Join(dir, "quod.db"))
+	secret, _, err := s.Create("carol", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "backup.db")
+	if err := s.Backup(dst); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(dst); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("backup mode: %v %v", fi, err)
+	}
+	if err := s.Backup(dst); err == nil {
+		t.Error("overwriting an existing backup should fail")
+	}
+	b := open(t, dst)
+	if p, err := authWith(b, "Bearer "+secret); err != nil || p.Name != "carol" {
+		t.Fatalf("backup lacks the key: %+v %v", p, err)
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".quod-backup-") {
+			t.Errorf("temp dir left behind: %s", e.Name())
+		}
+	}
+}

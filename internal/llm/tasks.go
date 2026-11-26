@@ -95,9 +95,9 @@ func (a *Agent) callProgress(ctx context.Context, spec ModelSpec, asJSON bool, o
 
 func (a *Agent) callTools(ctx context.Context, spec ModelSpec, asJSON bool, tools []Tool, onProgress func(Progress), msgs ...Message) (*Response, error) {
 	a.mu.Lock()
-	if a.opts.BudgetUSD > 0 && a.spent >= a.opts.BudgetUSD {
+	if spent := a.spent; a.opts.BudgetUSD > 0 && spent >= a.opts.BudgetUSD {
 		a.mu.Unlock()
-		return nil, fmt.Errorf("%w ($%.4f of $%.2f)", ErrBudget, a.spent, a.opts.BudgetUSD)
+		return nil, fmt.Errorf("%w ($%.4f of $%.2f)", ErrBudget, spent, a.opts.BudgetUSD)
 	}
 	a.mu.Unlock()
 

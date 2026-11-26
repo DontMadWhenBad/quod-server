@@ -71,7 +71,8 @@ echo "..." | ./bin/prove -json    # machine-readable result
 | `GET /v1/jobs/{id}/events` | SSE progress stream; resume with `Last-Event-ID` or `?after=N` |
 | `POST /v1/jobs/{id}/confirm` | `{"stmt": 1, "accept": true}` or `{"stmt": 1, "correction": "..."}` |
 | `POST /v1/jobs/{id}/cancel` | cancel a queued or running job |
-| `GET /healthz`, `GET /readyz` | liveness; readiness (Lean loaded) and stats |
+| `GET /v1/status` | your key's usage today (spend, remaining budget, active jobs) and server load |
+| `GET /healthz`, `GET /readyz` | public; liveness and readiness only (`{"ready": true}`), no stats |
 
 Job options: `confirm`, `budget_usd`, `attempts`, `parallel`, `no_split`, `no_explain`.
 Job states: `queued → running ⇄ awaiting_confirmation → done | failed | canceled`.
@@ -99,7 +100,25 @@ Pick the server with `-s URL` before the command (for example
 
 - **Limits:** `-max-running`, `-max-queued` (429 when full), `-job-budget`,
   `-max-job-budget`, `-daily-budget`, `-job-timeout`. Input is capped at 8 KB
-  and 10 statements.
+  and 10 statements. Per client:
+
+  | limit | default | flag |
+  |---|---|---|
+  | requests without a valid key, per client IP | 20/min, burst 10; once exhausted, keys are not checked | `-rate-unauth` |
+  | requests per key | 120/min, burst 30 | `-rate-key` |
+  | queued + running jobs per key | 2 | `-max-jobs-per-key` |
+  | open event streams per key | 8 | `-max-streams-per-key` |
+
+  A limited request gets 429 with `Retry-After`.
+- **Behind a reverse proxy** (e.g. Cloudflare Tunnel), set
+  `-trusted-proxies 127.0.0.1,::1`. The client IP is then taken from
+  `CF-Connecting-IP` or `X-Forwarded-For`, but only when the direct peer is a
+  trusted proxy; otherwise those headers are ignored so clients cannot spoof
+  them. Each request is logged with a request id (also returned as
+  `X-Request-ID`), client IP and key name, never the key itself.
+  Server-wide stats are logged once a minute.
+- **Auth off only locally:** `-auth none` refuses to start on anything but a
+  loopback address.
 - **Access keys** (`-auth keys`, the default): every `/v1` request needs
   `Authorization: Bearer qk_...`, a key issued by the server's admin.
   - Clients never handle the DeepSeek key; the service pays for LLM calls.
@@ -119,6 +138,7 @@ Pick the server with `-s URL` before the command (for example
   bin/quod-admin keys create --name alice --daily-budget 2   # prints the key once
   bin/quod-admin keys list
   bin/quod-admin keys revoke alice
+  bin/quod-admin db backup quod-backup.db    # consistent copy while the server runs (mode 0600)
   ```
 - **Storage:** jobs live in memory, are kept for 24 h, and are lost on restart.
 - **Shutdown:** on Ctrl-C or SIGTERM the server stops accepting jobs, waits

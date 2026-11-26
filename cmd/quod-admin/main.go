@@ -3,6 +3,7 @@
 //	quod-admin keys create --name alice [--daily-budget 2.00]   # prints the key once
 //	quod-admin keys list
 //	quod-admin keys revoke alice|k_3f9a1c2b
+//	quod-admin db backup FILE                                   # consistent copy, safe while the server runs
 //
 // Changes take effect on the running server's next request.
 package main
@@ -21,15 +22,19 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   quod-admin keys create --name NAME [--daily-budget USD] [--db quod.db]
   quod-admin keys list   [--db quod.db]
-  quod-admin keys revoke ID|NAME [--db quod.db]`)
+  quod-admin keys revoke ID|NAME [--db quod.db]
+  quod-admin db backup FILE [--db quod.db]`)
 	os.Exit(2)
 }
 
 func main() {
-	if len(os.Args) < 3 || os.Args[1] != "keys" {
+	if len(os.Args) < 3 || (os.Args[1] != "keys" && os.Args[1] != "db") {
 		usage()
 	}
 	cmd, args := os.Args[2], os.Args[3:]
+	if os.Args[1] == "db" {
+		cmd = "db-" + cmd
+	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	dbPath := fs.String("db", "quod.db", "SQLite database (same as the server's -db)")
 	store := func() *auth.KeyStore {
@@ -94,6 +99,24 @@ func main() {
 			fail(err)
 		}
 		fmt.Printf("revoked %s (%s)\n", k.ID, k.Name)
+	case "db-backup":
+		dst := ""
+		if len(args) > 0 && args[0] != "" && args[0][0] != '-' {
+			dst, args = args[0], args[1:]
+		}
+		_ = fs.Parse(args)
+		if dst == "" {
+			dst = fs.Arg(0)
+		}
+		if dst == "" {
+			usage()
+		}
+		s := store()
+		defer s.Close()
+		if err := s.Backup(dst); err != nil {
+			fail(err)
+		}
+		fmt.Printf("backed up %s to %s\n", *dbPath, dst)
 	default:
 		usage()
 	}

@@ -6,6 +6,7 @@
 #   echo "..." | scripts/client.sh prove -
 #   scripts/client.sh list | watch ID | result ID | status ID | cancel ID
 #   scripts/client.sh confirm ID STMT yes|no|"correction text"
+#   scripts/client.sh usage                                # your spend, budget and active jobs
 #   scripts/client.sh -s http://host:8080 prove "..."      # pick the server
 #
 # Global options (before the command):
@@ -312,6 +313,7 @@ case ${1:-} in
   cancel)  shift; api POST "/v1/jobs/${1:?usage: cancel ID}/cancel" | jq -r '"job \(.id): \(.state)"' ;;
   confirm) shift; cmd_confirm "$@" ;;
   health)  api GET /readyz | jq . ;;
+  usage)   api GET /v1/status | jq . ;;
   -h|--help|help|"") usage ;;
   *)       die "unknown command $1 (see --help)" ;;
 esac

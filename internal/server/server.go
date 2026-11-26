@@ -11,11 +11,15 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
+	"net/netip"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -36,8 +40,16 @@ type Server struct {
 	Auth      auth.Authenticator
 	Log       *slog.Logger  // default slog.Default()
 	Heartbeat time.Duration // SSE keep-alive interval; default 15s
+	// Limits caps request rates and open streams per client.
+	Limits Limits
+	// Proxies lists peers whose forwarding headers are believed.
+	Proxies ProxyTrust
 
 	manager atomic.Pointer[jobs.Manager]
+
+	unauth  *limiterTable // per client IP, requests without a valid key
+	perKey  *limiterTable // per principal
+	streams *counter      // open event streams per principal
 }
 
 // SetManager makes the server ready.
@@ -45,9 +57,16 @@ func (s *Server) SetManager(m *jobs.Manager) { s.manager.Store(m) }
 
 // Handler returns the routed handler with middleware applied.
 func (s *Server) Handler() http.Handler {
+	l := s.Limits.withDefaults()
+	s.Limits = l
+	s.unauth = newLimiterTable(l.UnauthPerMin, l.UnauthBurst, l.MaxEntries)
+	s.perKey = newLimiterTable(l.KeyPerMin, l.KeyBurst, l.MaxEntries)
+	s.streams = newCounter(l.MaxStreamsPerKey)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /readyz", s.readyz)
+	mux.HandleFunc("GET /v1/status", s.withManager(s.status))
 	mux.HandleFunc("POST /v1/jobs", s.withManager(s.createJob))
 	mux.HandleFunc("GET /v1/jobs", s.withManager(s.listJobs))
 	mux.HandleFunc("GET /v1/jobs/{id}", s.withManager(s.getJob))
@@ -105,13 +124,31 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// readyz is public, so it reveals nothing but readiness.
 func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
-	m := s.manager.Load()
-	if m == nil {
+	if s.manager.Load() == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ready": false})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ready": true, "stats": m.Stats()})
+	writeJSON(w, http.StatusOK, map[string]any{"ready": true})
+}
+
+// status reports the caller's own usage and the server's load.
+func (s *Server) status(w http.ResponseWriter, r *http.Request, m *jobs.Manager) {
+	p := principal(r)
+	u := m.OwnerUsage(p)
+	st := m.Stats()
+	cfg := m.Config()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ready":     true,
+		"principal": map[string]any{"name": p.Name},
+		"usage":     u,
+		"server": map[string]any{
+			"active_jobs": st.Active,
+			"max_running": cfg.MaxRunning,
+			"max_queued":  cfg.MaxQueued,
+		},
+	})
 }
 
 type createRequest struct {
@@ -221,6 +258,14 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request, m *jobs.Manager)
 	if !ok {
 		return
 	}
+	pid := principal(r).ID
+	if !s.streams.acquire(pid) {
+		w.Header().Set("Retry-After", "10")
+		writeError(w, http.StatusTooManyRequests, "too_many_streams",
+			fmt.Sprintf("at most %d open event streams per key", s.Limits.MaxStreamsPerKey))
+		return
+	}
+	defer s.streams.release(pid)
 	after := 0
 	for _, v := range []string{r.Header.Get("Last-Event-ID"), r.URL.Query().Get("after")} {
 		if n, err := strconv.Atoi(v); err == nil && n > after {
@@ -291,17 +336,44 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request, m *jobs.Manager)
 
 // ---------------------------------------------------------------- middleware
 
+// reqInfo travels with the request so the outer logger can report what
+// inner middleware learned.
+type reqInfo struct {
+	id        string
+	ip        netip.Addr
+	principal string
+}
+
+type reqInfoKey struct{}
+
+func info(r *http.Request) *reqInfo {
+	ri, _ := r.Context().Value(reqInfoKey{}).(*reqInfo)
+	if ri == nil {
+		ri = &reqInfo{}
+	}
+	return ri
+}
+
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
 			next.ServeHTTP(w, r)
 			return
 		}
+		ri := info(r)
 		p := auth.Anonymous
 		if s.Auth != nil {
+			ipKey := ri.ip.String()
+			// A client that keeps failing is refused before its
+			// credentials are even looked at.
+			if over, wait := s.unauth.exhausted(ipKey); over {
+				tooMany(w, wait, "too many unauthenticated requests")
+				return
+			}
 			var err error
 			p, err = s.Auth.Authenticate(r)
 			if err != nil {
+				s.unauth.allow(ipKey)
 				w.Header().Set("WWW-Authenticate", `Bearer realm="quod"`)
 				msg := "missing access key (Authorization: Bearer qk_...)"
 				if errors.Is(err, auth.ErrInvalid) {
@@ -311,8 +383,19 @@ func (s *Server) auth(next http.Handler) http.Handler {
 				return
 			}
 		}
+		ri.principal = p.Name
+		if ok, wait := s.perKey.allow(p.ID); !ok {
+			tooMany(w, wait, "rate limit exceeded for this key")
+			return
+		}
 		next.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), p)))
 	})
+}
+
+func tooMany(w http.ResponseWriter, wait time.Duration, msg string) {
+	secs := int(math.Ceil(wait.Seconds()))
+	w.Header().Set("Retry-After", strconv.Itoa(max(secs, 1)))
+	writeError(w, http.StatusTooManyRequests, "rate_limited", msg)
 }
 
 type statusRecorder struct {
@@ -328,14 +411,27 @@ func (r *statusRecorder) WriteHeader(code int) {
 // Unwrap lets http.ResponseController reach Flush/SetWriteDeadline.
 func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
+// logger assigns a request id, resolves the client IP, sets defensive
+// headers and logs one line per request (never the Authorization header).
 func (s *Server) logger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t0 := time.Now()
+		ri := &reqInfo{id: newRequestID(), ip: s.Proxies.ClientIP(r)}
+		h := w.Header()
+		h.Set("X-Request-ID", ri.id)
+		h.Set("X-Content-Type-Options", "nosniff")
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(rec, r)
-		s.log().Info("http", "method", r.Method, "path", r.URL.Path, "status", rec.status,
+		next.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), reqInfoKey{}, ri)))
+		s.log().Info("http", "id", ri.id, "ip", ri.ip.String(), "key", ri.principal,
+			"method", r.Method, "path", r.URL.Path, "status", rec.status,
 			"dur", time.Since(t0).Round(time.Millisecond))
 	})
+}
+
+func newRequestID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func (s *Server) recoverer(next http.Handler) http.Handler {
@@ -379,6 +475,9 @@ func writeManagerError(w http.ResponseWriter, err error) {
 	case errors.Is(err, jobs.ErrQueueFull):
 		w.Header().Set("Retry-After", "30")
 		writeError(w, http.StatusTooManyRequests, "queue_full", err.Error())
+	case errors.Is(err, jobs.ErrOwnerBusy):
+		w.Header().Set("Retry-After", "30")
+		writeError(w, http.StatusTooManyRequests, "too_many_jobs", err.Error())
 	case errors.Is(err, jobs.ErrDailyBudget):
 		writeError(w, http.StatusTooManyRequests, "daily_budget_exhausted", err.Error())
 	case errors.Is(err, jobs.ErrClosed):
@@ -390,6 +489,7 @@ func writeManagerError(w http.ResponseWriter, err error) {
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)

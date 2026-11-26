@@ -472,3 +472,148 @@ func TestNotReady(t *testing.T) {
 		}
 	}
 }
+
+func TestReadyzRevealsNothing(t *testing.T) {
+	h := newHarness(t, jobs.Config{}, nil)
+	var body map[string]any
+	if code := h.do("GET", "/readyz", "", &body); code != 200 || len(body) != 1 || body["ready"] != true {
+		t.Errorf("readyz = %d %v", code, body)
+	}
+}
+
+func TestStatusShowsOwnUsage(t *testing.T) {
+	store, err := auth.OpenKeyStore(filepath.Join(t.TempDir(), "quod.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	k, _, _ := store.Create("alice", 3)
+	h := newHarness(t, jobs.Config{}, store)
+	h.tok = k
+	v := h.submit(`{"input": "x", "options": {"no_explain": true}}`)
+	h.waitState(v.ID, jobs.StateDone)
+	var st struct {
+		Principal struct{ Name string }
+		Usage     jobs.Usage
+		Server    struct {
+			MaxRunning int `json:"max_running"`
+		}
+	}
+	if code := h.do("GET", "/v1/status", "", &st); code != 200 {
+		t.Fatalf("status %d", code)
+	}
+	if st.Principal.Name != "alice" || st.Usage.SpentTodayUSD <= 0 || st.Usage.DailyBudgetUSD != 3 ||
+		st.Usage.RemainingUSD == nil || *st.Usage.RemainingUSD >= 3 || st.Usage.MaxActiveJobs != 2 || st.Server.MaxRunning != 2 {
+		t.Errorf("status = %+v", st)
+	}
+	h.tok = ""
+	if code := h.do("GET", "/v1/status", "", nil); code != 401 {
+		t.Errorf("status without key: %d", code)
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	h := newHarness(t, jobs.Config{}, nil)
+	resp, err := http.Get(h.ts.URL + "/v1/jobs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(resp.Header.Get("X-Request-ID")) != 16 || resp.Header.Get("X-Content-Type-Options") != "nosniff" ||
+		resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("headers = %v", resp.Header)
+	}
+}
+
+// limitedHarness is a harness with tight limits.
+func limitedHarness(t *testing.T, a auth.Authenticator, l Limits, cfg jobs.Config) *harness {
+	t.Helper()
+	f := &fakeLLM{}
+	mgr := jobs.NewManager(jobs.Deps{Chatter: f, Checkers: pipeline.StaticSource{C: fakeLean{}}, Models: llm.DefaultModels()}, cfg)
+	srv := &Server{Auth: a, Log: discardLogger(), Heartbeat: 50 * time.Millisecond, Limits: l}
+	srv.SetManager(mgr)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = mgr.Shutdown(ctx)
+		ts.Close()
+	})
+	return &harness{t: t, ts: ts, mgr: mgr, llm: f}
+}
+
+func TestUnauthenticatedFloodIsThrottled(t *testing.T) {
+	store, _ := auth.OpenKeyStore(filepath.Join(t.TempDir(), "quod.db"))
+	defer store.Close()
+	good, _, _ := store.Create("alice", 0)
+	h := limitedHarness(t, store, Limits{UnauthPerMin: 1, UnauthBurst: 3}, jobs.Config{})
+	h.tok = "qk_wrong"
+	for i := range 3 {
+		if code := h.do("GET", "/v1/jobs", "", nil); code != 401 {
+			t.Fatalf("bad key %d: %d", i, code)
+		}
+	}
+	req, _ := http.NewRequest("GET", h.ts.URL+"/v1/jobs", nil)
+	req.Header.Set("Authorization", "Bearer "+good)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	// even a valid key from the same IP is refused while the IP is throttled
+	if resp.StatusCode != 429 || resp.Header.Get("Retry-After") == "" {
+		t.Errorf("throttled IP: %d retry-after=%q", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+	if code := h.do("GET", "/healthz", "", nil); code != 200 {
+		t.Errorf("healthz must stay reachable: %d", code)
+	}
+}
+
+func TestPerKeyRateAndCaps(t *testing.T) {
+	store, _ := auth.OpenKeyStore(filepath.Join(t.TempDir(), "quod.db"))
+	defer store.Close()
+	k, _, _ := store.Create("alice", 0)
+	other, _, _ := store.Create("bob", 0)
+
+	// request rate per key
+	h := limitedHarness(t, store, Limits{KeyPerMin: 1, KeyBurst: 2}, jobs.Config{})
+	h.tok = k
+	h.do("GET", "/v1/jobs", "", nil)
+	h.do("GET", "/v1/jobs", "", nil)
+	var e struct {
+		Error struct{ Code string } `json:"error"`
+	}
+	if code := h.do("GET", "/v1/jobs", "", &e); code != 429 || e.Error.Code != "rate_limited" {
+		t.Errorf("third request: %d %+v", code, e)
+	}
+	h.tok = other
+	if code := h.do("GET", "/v1/jobs", "", nil); code != 200 {
+		t.Errorf("limits are per key: %d", code)
+	}
+
+	// active jobs and open streams per key
+	h2 := limitedHarness(t, store, Limits{MaxStreamsPerKey: 1}, jobs.Config{MaxActivePerKey: 1})
+	h2.llm.gate = make(chan struct{}) // keep the job running
+	h2.tok = k
+	v := h2.submit(`{"input": "x"}`)
+	if code := h2.do("POST", "/v1/jobs", `{"input": "y"}`, &e); code != 429 || e.Error.Code != "too_many_jobs" {
+		t.Errorf("second active job: %d %+v", code, e)
+	}
+	h2.tok = other
+	h2.submit(`{"input": "z"}`) // another key is unaffected
+	h2.tok = k
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", h2.ts.URL+"/v1/jobs/"+v.ID+"/events", nil)
+	req.Header.Set("Authorization", "Bearer "+k)
+	resp, err := http.DefaultClient.Do(req) // first stream stays open
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if code := h2.do("GET", "/v1/jobs/"+v.ID+"/events", "", &e); code != 429 || e.Error.Code != "too_many_streams" {
+		t.Errorf("second stream: %d %+v", code, e)
+	}
+	close(h2.llm.gate)
+}

@@ -22,6 +22,7 @@ var (
 	ErrClosed      = errors.New("server is shutting down")
 	ErrInvalid     = errors.New("invalid request")
 	ErrDailyBudget = errors.New("daily LLM budget exhausted")
+	ErrOwnerBusy   = errors.New("too many active jobs for this key")
 )
 
 // Deps are the shared resources every job uses.
@@ -37,6 +38,7 @@ type Deps struct {
 type Config struct {
 	MaxRunning       int              // concurrent jobs; default 2
 	MaxQueued        int              // waiting jobs before ErrQueueFull; default 32
+	MaxActivePerKey  int              // queued + running jobs per principal; default 2
 	MaxInputBytes    int              // default 8192
 	MaxStatements    int              // per job; default 10
 	DefaultBudgetUSD float64          // default 0.25
@@ -60,6 +62,7 @@ func (c Config) withDefaults() Config {
 	}
 	def(&c.MaxRunning, 2)
 	def(&c.MaxQueued, 32)
+	def(&c.MaxActivePerKey, 2)
 	def(&c.MaxInputBytes, 8192)
 	def(&c.MaxStatements, 10)
 	def(&c.MaxAttempts, 12)
@@ -105,6 +108,8 @@ type Manager struct {
 	daySpent float64
 	// ownerSpent is today's spending per principal ID.
 	ownerSpent map[string]float64
+	// ownerActive counts queued + running jobs per principal ID.
+	ownerActive map[string]int
 }
 
 // NewManager starts a manager (and its janitor goroutine).
@@ -118,7 +123,8 @@ func NewManager(deps Deps, cfg Config) *Manager {
 		stop: make(chan struct{}),
 		jobs: map[string]*Job{},
 
-		ownerSpent: map[string]float64{},
+		ownerSpent:  map[string]float64{},
+		ownerActive: map[string]int{},
 	}
 	go m.janitor()
 	return m
@@ -157,6 +163,9 @@ func (m *Manager) Submit(input string, opts Options, owner *auth.Principal) (*Jo
 	if m.active >= m.cfg.MaxRunning+m.cfg.MaxQueued {
 		return nil, ErrQueueFull
 	}
+	if m.ownerActive[owner.ID] >= m.cfg.MaxActivePerKey {
+		return nil, fmt.Errorf("%w (limit %d); wait for one to finish or cancel it", ErrOwnerBusy, m.cfg.MaxActivePerKey)
+	}
 	// Approximate caps: concurrent jobs may together overshoot by about
 	// one job's budget.
 	budget := opts.BudgetUSD
@@ -182,6 +191,7 @@ func (m *Manager) Submit(input string, opts Options, owner *auth.Principal) (*Jo
 	j.cancel = cancel
 	m.jobs[j.ID] = j
 	m.active++
+	m.ownerActive[owner.ID]++
 	m.wg.Add(1)
 	go m.run(ctx, cancel, j)
 	return j, nil
@@ -193,6 +203,9 @@ func (m *Manager) run(ctx context.Context, cancel context.CancelFunc, j *Job) {
 	defer func() {
 		m.mu.Lock()
 		m.active--
+		if m.ownerActive[j.Owner.ID]--; m.ownerActive[j.Owner.ID] <= 0 {
+			delete(m.ownerActive, j.Owner.ID)
+		}
 		m.mu.Unlock()
 	}()
 
@@ -287,6 +300,31 @@ func (m *Manager) Cancel(id string) error {
 	}
 	j.requestCancel()
 	return nil
+}
+
+// Usage is one principal's consumption, for GET /v1/status.
+type Usage struct {
+	SpentTodayUSD  float64  `json:"spent_today_usd"`
+	DailyBudgetUSD float64  `json:"daily_budget_usd,omitempty"` // 0 = only server-wide caps
+	RemainingUSD   *float64 `json:"remaining_usd,omitempty"`
+	ActiveJobs     int      `json:"active_jobs"`
+	MaxActiveJobs  int      `json:"max_active_jobs"`
+}
+
+// OwnerUsage reports p's spending today and active jobs.
+func (m *Manager) OwnerUsage(p *auth.Principal) Usage {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rollDayLocked()
+	u := Usage{
+		SpentTodayUSD: m.ownerSpent[p.ID], DailyBudgetUSD: p.DailyBudgetUSD,
+		ActiveJobs: m.ownerActive[p.ID], MaxActiveJobs: m.cfg.MaxActivePerKey,
+	}
+	if p.DailyBudgetUSD > 0 {
+		left := max(p.DailyBudgetUSD-u.SpentTodayUSD, 0)
+		u.RemainingUSD = &left
+	}
+	return u
 }
 
 // Stats is a snapshot for health endpoints.
