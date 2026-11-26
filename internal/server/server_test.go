@@ -660,8 +660,19 @@ func TestCORSHeaders(t *testing.T) {
 			t.Fatalf("preflight: %d %v", resp.StatusCode, resp.Header)
 		}
 	}
+	// Private Network Access preflight: granted only when asked, to allowed origins
+	resp := do("OPTIONS", "https://me.github.io", "", map[string]string{
+		"Access-Control-Request-Method": "GET", "Access-Control-Request-Private-Network": "true"})
+	if resp.StatusCode != 204 || resp.Header.Get("Access-Control-Allow-Private-Network") != "true" {
+		t.Errorf("PNA preflight: %d %v", resp.StatusCode, resp.Header)
+	}
+	resp = do("OPTIONS", "https://me.github.io", "", map[string]string{"Access-Control-Request-Method": "GET"})
+	if resp.Header.Get("Access-Control-Allow-Private-Network") != "" {
+		t.Error("PNA header sent without being requested")
+	}
+
 	// actual request from the allowed origin gets CORS headers, credentials never
-	resp := do("GET", "https://me.github.io", k, nil)
+	resp = do("GET", "https://me.github.io", k, nil)
 	if resp.StatusCode != 200 || resp.Header.Get("Access-Control-Allow-Origin") != "https://me.github.io" ||
 		resp.Header.Get("Access-Control-Allow-Credentials") != "" || !strings.Contains(resp.Header.Get("Access-Control-Expose-Headers"), "X-Request-ID") {
 		t.Errorf("allowed origin: %d %v", resp.StatusCode, resp.Header)
@@ -674,5 +685,11 @@ func TestCORSHeaders(t *testing.T) {
 	resp = do("OPTIONS", "https://evil.example", "", map[string]string{"Access-Control-Request-Method": "GET"})
 	if resp.Header.Get("Access-Control-Allow-Origin") != "" || resp.StatusCode == 204 {
 		t.Errorf("foreign preflight: %d %v", resp.StatusCode, resp.Header)
+	}
+	// (foreign preflights fall through to auth, so this runs last)
+	resp = do("OPTIONS", "https://evil.example", "", map[string]string{
+		"Access-Control-Request-Method": "GET", "Access-Control-Request-Private-Network": "true"})
+	if resp.Header.Get("Access-Control-Allow-Private-Network") != "" {
+		t.Error("PNA granted to a foreign origin")
 	}
 }

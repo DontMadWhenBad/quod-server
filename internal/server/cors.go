@@ -55,6 +55,12 @@ func (s *Server) cors(next http.Handler) http.Handler {
 			h.Set("Access-Control-Allow-Methods", "GET, POST")
 			h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID")
 			h.Set("Access-Control-Max-Age", "600")
+			// Private Network Access: a public page (e.g. GitHub Pages) calling
+			// this server through a private address (e.g. a Tailscale IP)
+			// gets a preflight asking permission; grant it to allowed origins.
+			if strings.EqualFold(r.Header.Get("Access-Control-Request-Private-Network"), "true") {
+				h.Set("Access-Control-Allow-Private-Network", "true")
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
