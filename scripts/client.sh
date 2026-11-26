@@ -12,6 +12,9 @@
 # Global options (before the command):
 #   -s, --server URL      server base URL (overrides PROVER_URL)
 #   -k, --key-file PATH   access key file (default ~/.config/quod/key)
+#   -r, --raw             print server responses as-is (JSON): one document per
+#                         response, event streams as one JSON object per line;
+#                         on HTTP errors the error body goes to stderr (exit 1)
 #
 # Environment:
 #   PROVER_URL  server base URL (default http://127.0.0.1:8080)
@@ -22,8 +25,11 @@ die() { printf 'client: %s\n' "$*" >&2; exit 1; }
 
 URL="${PROVER_URL:-http://127.0.0.1:8080}"
 KEY_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/quod/key"
+RAW=0
 while (( $# )); do
   case $1 in
+    -r|--raw)
+      RAW=1; shift ;;
     -s|--server)
       [[ $# -ge 2 && -n $2 ]] || die "$1 needs a URL"
       URL=$2; shift 2 ;;
@@ -42,7 +48,7 @@ URL="${URL%/}"
 command -v curl >/dev/null || die "curl not found"
 command -v jq   >/dev/null || die "jq not found"
 
-if [[ -t 1 ]]; then
+if [[ -t 1 && $RAW == 0 ]]; then
   B=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' GRN=$'\e[32m' YEL=$'\e[33m' BLU=$'\e[34m' RST=$'\e[0m'
 else
   B='' DIM='' RED='' GRN='' YEL='' BLU='' RST=''
@@ -71,9 +77,30 @@ api() {
   code=${out##*$'\n'}
   out=${out%$'\n'*}
   if (( code >= 400 )); then
+    if (( RAW )); then
+      printf '%s\n' "$out" >&2  # stderr: api often runs inside $(...)
+      exit 1
+    fi
     die "HTTP $code: $(jq -r '.error.message // .' <<<"$out" 2>/dev/null || echo "$out")"
   fi
   printf '%s' "$out"
+}
+
+# call METHOD PATH [BODY] [FILTER]: request, then show; exits 1 if the
+# request failed (a failing $(...) inside an argument would not stop set -e).
+call() {
+  local out
+  out=$(api "$1" "$2" "${3:-}") || exit 1
+  show "$out" "${4:-.}"
+}
+
+# show prints a response body raw (--raw) or through the jq filter in $2.
+show() {
+  if (( RAW )); then
+    printf '%s\n' "$1"
+  else
+    jq -r "${2:-.}" <<<"$1"
+  fi
 }
 
 usage() {
@@ -140,6 +167,10 @@ color_for() {
 
 START=$SECONDS
 show_event() { # $1 = event json
+  if (( RAW )); then
+    printf '%s\n' "$1"
+    return
+  fi
   local type text
   type=$(jq -r .type <<<"$1")
   text=$(jq -r --argjson verbose "$VERBOSE" "$RENDER" <<<"$1")
@@ -204,6 +235,10 @@ stream_job() {
 # ------------------------------------------------------------------ result
 
 print_result() { # $1 = job id
+  if (( RAW )); then
+    call GET "/v1/jobs/$1"
+    return
+  fi
   api GET "/v1/jobs/$1" | jq -r --arg B "$B" --arg R "$RST" --arg G "$GRN" --arg X "$RED" '
     def one: gsub("\\s+"; " ");
     def ind: split("\n") | map("    " + .) | join("\n");
@@ -271,7 +306,11 @@ cmd_prove() {
       attempts: $attempts, parallel: $parallel, budget_usd: $budget} | with_entries(select(.value != 0 and .value != false)))}')
   view=$(api POST /v1/jobs "$body")
   JOB_ID=$(jq -r .id <<<"$view")
-  printf '%sjob %s submitted (budget $%s)%s\n' "$B" "$JOB_ID" "$(jq -r .budget_usd <<<"$view")" "$RST"
+  if (( RAW )); then
+    show "$view"
+  else
+    printf '%sjob %s submitted (budget $%s)%s\n' "$B" "$JOB_ID" "$(jq -r .budget_usd <<<"$view")" "$RST"
+  fi
   trap on_interrupt INT
   stream_job "$JOB_ID"
   trap - INT
@@ -287,10 +326,16 @@ cmd_watch() {
 }
 
 cmd_list() {
-  api GET "/v1/jobs?limit=${1:-20}" | jq -r '
+  local body
+  body=$(api GET "/v1/jobs?limit=${1:-20}")
+  if (( RAW )); then
+    show "$body"
+    return
+  fi
+  jq -r '
     (["ID", "STATE", "PROVED", "COST", "CREATED", "INPUT"] | @tsv),
     (.jobs[] | [.id, .state + (if .awaiting_confirmation then "*" else "" end), "\(.proved)/\(.total)",
-      "$\(((.cost_usd // 0) * 10000 | round) / 10000)", (.created | .[0:19]), (.input | gsub("\\s+";" ") | .[0:60])] | @tsv)' |
+      "$\(((.cost_usd // 0) * 10000 | round) / 10000)", (.created | .[0:19]), (.input | gsub("\\s+";" ") | .[0:60])] | @tsv)' <<<"$body" |
     column -t -s $'\t'
 }
 
@@ -301,19 +346,19 @@ cmd_confirm() {
     n|no)  body=$(jq -nc --argjson s "$stmt" '{stmt: $s, accept: false}') ;;
     *)     body=$(jq -nc --argjson s "$stmt" --arg c "$ans" '{stmt: $s, accept: false, correction: $c}') ;;
   esac
-  api POST "/v1/jobs/$id/confirm" "$body" | jq -r '"job \(.id): \(.state)"'
+  call POST "/v1/jobs/$id/confirm" "$body" '"job \(.id): \(.state)"'
 }
 
 case ${1:-} in
   prove)   shift; cmd_prove "$@" ;;
   watch)   shift; cmd_watch "$@" ;;
   result)  shift; print_result "${1:?usage: result ID}" ;;
-  status)  shift; api GET "/v1/jobs/${1:?usage: status ID}${2:+?detail=full}" | jq . ;;
+  status)  shift; call GET "/v1/jobs/${1:?usage: status ID}${2:+?detail=full}" ;;
   list)    shift; cmd_list "$@" ;;
-  cancel)  shift; api POST "/v1/jobs/${1:?usage: cancel ID}/cancel" | jq -r '"job \(.id): \(.state)"' ;;
+  cancel)  shift; call POST "/v1/jobs/${1:?usage: cancel ID}/cancel" "" '"job \(.id): \(.state)"' ;;
   confirm) shift; cmd_confirm "$@" ;;
-  health)  api GET /readyz | jq . ;;
-  usage)   api GET /v1/status | jq . ;;
+  health)  call GET /readyz ;;
+  usage)   call GET /v1/status ;;
   -h|--help|help|"") usage ;;
   *)       die "unknown command $1 (see --help)" ;;
 esac

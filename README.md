@@ -91,7 +91,13 @@ terminal, reconnect on dropped streams, and Ctrl-C to cancel:
 scripts/client.sh prove "For all real x, x^2 >= 0."
 scripts/client.sh prove --confirm -v "1) ... 2) ..."
 scripts/client.sh list | watch ID | result ID | status ID | cancel ID
+scripts/client.sh -r prove "..." | jq -c 'select(.type=="attempt")'   # --raw: server JSON as-is
 ```
+
+With `-r`/`--raw`, each command prints the server's JSON unchanged.
+`prove` and `watch` print one JSON object per line: the submitted job,
+every event, then the final job. Error bodies go to stderr, with exit
+status 1.
 
 Pick the server with `-s URL` before the command (for example
 `scripts/client.sh -s http://127.0.0.1:18080 list`) or with `PROVER_URL`
